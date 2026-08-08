@@ -15,6 +15,7 @@
 
 pub mod test_call_graph;
 pub mod test_credits;
+pub mod test_deploy_rng_split;
 pub mod test_execute;
 pub mod test_random;
 pub mod test_serializers;
