@@ -16,6 +16,7 @@
 pub mod test_call_graph;
 pub mod test_credits;
 pub mod test_execute;
+pub mod test_get_record_dynamic_rng_split;
 pub mod test_random;
 pub mod test_serializers;
 pub mod test_upgrade;
