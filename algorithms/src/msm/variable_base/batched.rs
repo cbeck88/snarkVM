@@ -53,7 +53,7 @@ impl PartialOrd for BucketPosition {
 /// Returns a batch size of sufficient size to amortize the cost of an
 /// inversion, while attempting to reduce strain to the CPU cache.
 #[inline]
-const fn batch_size(msm_size: usize) -> usize {
+pub(super) const fn batch_size(msm_size: usize) -> usize {
     // These values are determined empirically using performance benchmarks for
     // BLS12-377 on Intel, AMD, and M1 machines. These values are determined by
     // taking the L1 and L2 cache sizes and dividing them by the size of group
@@ -175,11 +175,27 @@ fn batch_add_write<G: AffineCurve>(
 }
 
 #[inline]
+#[allow(unsafe_code)]
 pub(super) fn batch_add<G: AffineCurve>(
     num_buckets: usize,
     bases: &[G],
     bucket_positions: &mut [BucketPosition],
+    #[cfg(target_arch = "x86_64")] ifma_bases: Option<&super::ifma_batch_add::PointBuf>,
 ) -> Vec<G> {
+    // On CPUs with AVX512-IFMA, BLS12-377 G1 takes an eight-lane path that
+    // produces bit-identical results. See `ifma_batch_add`. The converted bases
+    // are supplied by the caller so the domain change is paid once per MSM
+    // rather than once per window -- converting per window costs about as much
+    // as the vectorized arithmetic saves.
+    #[cfg(target_arch = "x86_64")]
+    if let Some(ifma_bases) = ifma_bases {
+        let result = super::ifma_batch_add::batch_add(num_buckets, ifma_bases, bucket_positions);
+        // SAFETY: `ifma_bases` is only ever `Some` when `G` is `G1Affine`, which
+        // `msm` establishes by `TypeId`, so this is an identity cast.
+        let mut result = core::mem::ManuallyDrop::new(result);
+        return unsafe { Vec::from_raw_parts(result.as_mut_ptr() as *mut G, result.len(), result.capacity()) };
+    }
+
     assert!(bases.len() >= bucket_positions.len());
     assert!(!bases.is_empty());
 
@@ -336,6 +352,7 @@ fn batched_window<G: AffineCurve>(
     scalars: &[<G::ScalarField as PrimeField>::BigInteger],
     w_start: usize,
     c: usize,
+    #[cfg(target_arch = "x86_64")] ifma_bases: Option<&super::ifma_batch_add::PointBuf>,
 ) -> (G::Projective, usize) {
     // We don't need the "zero" bucket, so we only have 2^c - 1 buckets
     let window_size = if !w_start.is_multiple_of(c) { w_start % c } else { c };
@@ -357,6 +374,9 @@ fn batched_window<G: AffineCurve>(
         })
         .collect();
 
+    #[cfg(target_arch = "x86_64")]
+    let buckets = batch_add(num_buckets, bases, &mut bucket_positions, ifma_bases);
+    #[cfg(not(target_arch = "x86_64"))]
     let buckets = batch_add(num_buckets, bases, &mut bucket_positions);
 
     let mut res = G::Projective::zero();
@@ -403,6 +423,27 @@ pub fn msm<G: AffineCurve>(bases: &[G], scalars: &[<G::ScalarField as PrimeField
         // Each window is of size `c`.
         // We divide up the bits 0..num_bits into windows of size `c`, and
         // in parallel process each such window.
+        // Enter the IFMA domain once for the whole MSM, if this is BLS12-377 G1
+        // on a CPU that supports it.
+        #[cfg(target_arch = "x86_64")]
+        #[allow(unsafe_code)]
+        let ifma_bases = {
+            use snarkvm_curves::bls12_377::G1Affine;
+            match core::any::TypeId::of::<G>() == core::any::TypeId::of::<G1Affine>() && super::ifma::is_enabled() {
+                // SAFETY: the `TypeId` comparison establishes that `G` is `G1Affine`.
+                true => Some(super::ifma_batch_add::PointBuf::from_affine(unsafe {
+                    &*(bases as *const [G] as *const [G1Affine])
+                })),
+                false => None,
+            }
+        };
+
+        #[cfg(target_arch = "x86_64")]
+        let window_sums: Vec<_> = cfg_into_iter!(0..num_bits)
+            .step_by(c)
+            .map(|w_start| batched_window(bases, scalars, w_start, c, ifma_bases.as_ref()))
+            .collect();
+        #[cfg(not(target_arch = "x86_64"))]
         let window_sums: Vec<_> =
             cfg_into_iter!(0..num_bits).step_by(c).map(|w_start| batched_window(bases, scalars, w_start, c)).collect();
 

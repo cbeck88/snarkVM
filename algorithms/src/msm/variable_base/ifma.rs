@@ -32,8 +32,8 @@
 //! `prefetch.rs` for `_mm_prefetch`.
 #![allow(unsafe_code)]
 
-use snarkvm_curves::bls12_377::Fq;
-use snarkvm_fields::PrimeField;
+use snarkvm_curves::bls12_377::{Fq, FqParameters};
+use snarkvm_fields::Fp384;
 use snarkvm_utilities::BigInteger384;
 
 /// The number of field elements processed per vector operation.
@@ -59,21 +59,30 @@ const P: [u64; LIMBS] = [
 /// `-P^{-1} mod 2^52`.
 const N0INV: u64 = 0x8bfffffffffff;
 
-/// `2^832 mod P`, i.e. `R^2` for this domain. Montgomery-multiplying a plain
-/// integer by this yields its representative here.
-const R2: [u64; LIMBS] = [
-    0xd014cc5b719df,
-    0x47a218af94bbe,
-    0x2ccac59293408,
-    0x56a1842f83106,
-    0x50716cfa4b8f6,
-    0xe6c42524c1142,
-    0xe60defedc7051,
-    0x0000000000cfc,
+/// `2^448 mod P`. Shifts a value from the scalar domain (`R = 2^384`) into this
+/// one directly, without first reducing to a canonical integer.
+const TO_IFMA: [u64; LIMBS] = [
+    0x07ccefe7c5a25,
+    0x9dee49ccfcf9a,
+    0x3dc3ff79f2a81,
+    0xb7eaa16af28b0,
+    0xe5d18e3b07d04,
+    0x85efd62fb7463,
+    0x8c84314d2bbc1,
+    0x0000000000197,
 ];
 
-/// The integer one, used to leave the domain.
-const ONE: [u64; LIMBS] = [1, 0, 0, 0, 0, 0, 0, 0];
+/// `2^384 mod P`, the inverse shift.
+const FROM_IFMA: [u64; LIMBS] = [
+    0xdffffffffff68,
+    0x837fffffb102c,
+    0xa7d3ff251409f,
+    0x63059f7db3a98,
+    0x87b4e97b76e7c,
+    0xf495bf803c84e,
+    0x661e2fdf49a4c,
+    0x00000000008d6,
+];
 
 /// Returns `true` if this CPU supports the instructions this backend needs.
 ///
@@ -82,7 +91,23 @@ const ONE: [u64; LIMBS] = [1, 0, 0, 0, 0, 0, 0, 0];
 /// while lacking `vpmadd52`.
 #[inline]
 pub fn is_available() -> bool {
-    std::arch::is_x86_feature_detected!("avx512f") && std::arch::is_x86_feature_detected!("avx512ifma")
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        std::arch::is_x86_feature_detected!("avx512f") && std::arch::is_x86_feature_detected!("avx512ifma")
+    })
+}
+
+/// Whether the MSM should actually dispatch to the vectorized path.
+///
+/// Off unless `SNARKVM_ENABLE_AVX512_IFMA` is set. The kernel itself is
+/// measurably faster than the scalar one, but the wired path is not yet a net
+/// win end to end -- see the `ifma_batch_add` module docs -- so it stays opt-in
+/// until that is closed. Correctness does not depend on this switch: both paths
+/// produce identical results, which the tests check.
+#[inline]
+pub fn is_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| is_available() && std::env::var_os("SNARKVM_ENABLE_AVX512_IFMA").is_some())
 }
 
 // ---------------------------------------------------------------------------
@@ -218,16 +243,51 @@ pub fn sub_ref(a: &[u64; LIMBS], b: &[u64; LIMBS]) -> [u64; LIMBS] {
     out
 }
 
+/// Re-chunks the raw Montgomery limbs of `x` into radix 2^52 without changing
+/// the value. The result still carries the scalar domain's `R = 2^384`; a
+/// multiply by [`TO_IFMA`] completes the move.
+#[inline]
+pub fn regroup_raw(x: &Fq) -> [u64; LIMBS] {
+    regroup_64_to_52(&x.0.0)
+}
+
+/// Finishes the conversion started by [`regroup_raw`], one element at a time.
+#[inline]
+pub fn shift_into_domain(raw: &[u64; LIMBS]) -> [u64; LIMBS] {
+    mont_mul_ref(raw, &TO_IFMA)
+}
+
 /// Converts a scalar `Fq` into this backend's Montgomery domain.
 pub fn to_ifma(x: &Fq) -> [u64; LIMBS] {
-    mont_mul_ref(&regroup_64_to_52(&x.to_bigint().0), &R2)
+    shift_into_domain(&regroup_raw(x))
 }
 
 /// Converts back into a scalar `Fq`.
 pub fn from_ifma(x: &[u64; LIMBS]) -> Fq {
-    let canonical = mont_mul_ref(x, &ONE);
-    // The value is a canonical residue below `P`, so this never fails.
-    Fq::from_bigint(BigInteger384(regroup_52_to_64(&canonical))).unwrap()
+    // Shifting by `FROM_IFMA` lands directly on the scalar Montgomery form, so
+    // the result can be rebuilt without a second conversion.
+    Fp384::<FqParameters>(BigInteger384(regroup_52_to_64(&mont_mul_ref(x, &FROM_IFMA))), core::marker::PhantomData)
+}
+
+/// Moves a whole slice into the domain in place, eight elements at a time.
+/// Each element must already have passed through [`regroup_raw`].
+pub fn shift_into_domain_slice(raw: &mut [[u64; LIMBS]]) {
+    if is_available() {
+        let mut chunks = raw.chunks_exact_mut(LANES);
+        for chunk in &mut chunks {
+            let staged: [[u64; LIMBS]; LANES] = std::array::from_fn(|l| chunk[l]);
+            // SAFETY: `is_available` was checked above.
+            let converted = unsafe { mul_x8(&Fq8::load(&staged), &Fq8::load(&[TO_IFMA; LANES])).store() };
+            chunk.copy_from_slice(&converted);
+        }
+        for elem in chunks.into_remainder() {
+            *elem = shift_into_domain(elem);
+        }
+    } else {
+        for elem in raw.iter_mut() {
+            *elem = shift_into_domain(elem);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -433,7 +493,7 @@ pub unsafe fn sub_x8(a: &Fq8, b: &Fq8) -> Fq8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use snarkvm_fields::{One, Zero};
+    use snarkvm_fields::{One, PrimeField, Zero};
     use snarkvm_utilities::{TestRng, Uniform};
 
     const ITERATIONS: usize = 5000;

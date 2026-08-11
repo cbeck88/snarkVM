@@ -16,6 +16,8 @@
 pub mod batched;
 #[cfg(target_arch = "x86_64")]
 pub mod ifma;
+#[cfg(target_arch = "x86_64")]
+pub mod ifma_batch_add;
 pub mod standard;
 
 #[cfg(target_arch = "x86_64")]
