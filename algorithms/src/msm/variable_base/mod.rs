@@ -14,6 +14,8 @@
 // limitations under the License.
 
 pub mod batched;
+#[cfg(target_arch = "x86_64")]
+pub mod ifma;
 pub mod standard;
 
 #[cfg(target_arch = "x86_64")]
