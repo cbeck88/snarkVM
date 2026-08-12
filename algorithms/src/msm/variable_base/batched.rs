@@ -53,7 +53,7 @@ impl PartialOrd for BucketPosition {
 /// Returns a batch size of sufficient size to amortize the cost of an
 /// inversion, while attempting to reduce strain to the CPU cache.
 #[inline]
-pub(super) const fn batch_size(msm_size: usize) -> usize {
+const fn batch_size(msm_size: usize) -> usize {
     // These values are determined empirically using performance benchmarks for
     // BLS12-377 on Intel, AMD, and M1 machines. These values are determined by
     // taking the L1 and L2 cache sizes and dividing them by the size of group

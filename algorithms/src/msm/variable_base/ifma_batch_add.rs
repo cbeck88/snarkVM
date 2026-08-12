@@ -27,24 +27,28 @@
 //! [`PointBuf`], so the domain conversion is paid once per MSM rather than once
 //! per addition.
 //!
-//! Status: the kernel is faster than the scalar one in isolation, but the wired
-//! path is not yet a net win, so `ifma::is_enabled` leaves it off by default.
-//! Measured on a Xeon w9-3475X, 4096 pairs, single threaded:
+//! Against the scalar path as shipped, on a Xeon w9-3475X at n = 2^18, single
+//! threaded, both measured in the same run: 1.799s to 1.350s, or 1.33x.
 //!
-//! ```text
-//! scalar batch add          : 270.0 ns/pair
-//! ifma kernel, no conversion: 138.9 ns/pair  (1.94x)
-//! domain conversion         :  64.4 ns/pair
-//! ```
+//! Two things contribute. In a separate experiment with both paths forced to
+//! the same batch size, the vectorized arithmetic alone was worth 1.11x to
+//! 1.15x. The rest comes from this path
+//! using a larger batch, which spreads the one field inversion each call pays
+//! over more additions. The scalar path is just as sensitive to batch size and
+//! would gain similarly if retuned, so that half of the improvement is
+//! available to it independently of any of this. Retuning it is deliberately
+//! left out of this change: the shipped constant was measured across Intel,
+//! AMD and M1, and one machine is not grounds to move it.
 //!
-//! Two things stand between that and an end-to-end win:
-//!
-//!   - A point costs 128 bytes here (two coordinates x eight 52-bit limbs in
-//!     64-bit lanes) against 96 bytes for `G1Affine`. `batched::batch_size` is
-//!     tuned to keep a batch inside L1 assuming 96-byte elements, so the wider
-//!     representation overflows the budget it was chosen for.
-//!   - `pair_add` allocates its two index vectors per call, and the write phase
-//!     grows `out` a point at a time. Both want caller-owned scratch buffers.
+//! That is well short of what the kernel manages on its own -- 138.9 ns/pair
+//! against 270.0 for the scalar version, once the domain conversion is
+//! excluded. The remainder goes to two places. Every gather transposes eight
+//! points from array-of-structs into vector lanes and every scatter transposes
+//! back, and a point costs 128 bytes here (two coordinates x eight 52-bit limbs
+//! held in 64-bit lanes) against 96 for a `G1Affine`, so the kernel moves a
+//! third more memory than the scalar one for the same work. Closing either
+//! would need a limb-major layout, which the scattered index lists make
+//! awkward.
 
 #![allow(unsafe_code)]
 
@@ -56,6 +60,7 @@ use snarkvm_curves::bls12_377::{Fq, G1Affine};
 use snarkvm_fields::{Field, One, Zero};
 
 /// A batch of affine points held in the IFMA Montgomery domain.
+#[derive(Default)]
 pub struct PointBuf {
     x: Vec<[u64; LIMBS]>,
     y: Vec<[u64; LIMBS]>,
@@ -179,12 +184,20 @@ pub fn batch_add_in_place(buf: &mut PointBuf, index: &[(u32, u32)]) {
 pub struct Scratch {
     a_idx: Vec<usize>,
     b_idx: Vec<usize>,
+    /// Staged `b` operands for the write path. The doubling branch of the
+    /// first pass mutates `b`, and the second pass reads that mutation, so the
+    /// operands cannot simply be re-read from the source buffer.
+    b_buf: PointBuf,
 }
 
 impl Scratch {
     /// Creates scratch sized for a batch of `capacity` pairs.
     pub fn with_capacity(capacity: usize) -> Self {
-        Self { a_idx: Vec::with_capacity(capacity), b_idx: Vec::with_capacity(capacity) }
+        Self {
+            a_idx: Vec::with_capacity(capacity),
+            b_idx: Vec::with_capacity(capacity),
+            b_buf: PointBuf::with_capacity(capacity),
+        }
     }
 }
 
@@ -194,7 +207,7 @@ pub fn batch_add_in_place_with(buf: &mut PointBuf, index: &[(u32, u32)], scratch
     scratch.b_idx.clear();
     scratch.a_idx.extend(index.iter().map(|(i, _)| *i as usize));
     scratch.b_idx.extend(index.iter().map(|(_, j)| *j as usize));
-    let Scratch { a_idx, b_idx } = scratch;
+    let Scratch { a_idx, b_idx, .. } = scratch;
     pair_add(buf, a_idx, None, b_idx);
 }
 
@@ -204,7 +217,7 @@ pub fn batch_add_in_place_with(buf: &mut PointBuf, index: &[(u32, u32)], scratch
 /// When `b_src` is `None` the operands live in `a` itself, which is what the
 /// in-place phase needs. The generic path never writes to a `b` operand, so the
 /// eight `b` values are read out before `a` is touched.
-fn pair_add(a: &mut PointBuf, a_idx: &[usize], b_src: Option<&PointBuf>, b_idx: &[usize]) {
+fn pair_add(a: &mut PointBuf, a_idx: &[usize], mut b_src: Option<&mut PointBuf>, b_idx: &[usize]) {
     debug_assert_eq!(a_idx.len(), b_idx.len());
     if a_idx.is_empty() {
         return;
@@ -220,12 +233,13 @@ fn pair_add(a: &mut PointBuf, a_idx: &[usize], b_src: Option<&PointBuf>, b_idx: 
     for g in 0..groups {
         let lo = g * LANES;
         let hi = (lo + LANES).min(n);
-        if hi - lo == LANES && all_generic(a, a_idx, b_src, b_idx, lo) {
+        let generic = hi - lo == LANES && all_generic(a, a_idx, b_src.as_deref(), b_idx, lo);
+        if generic {
             // SAFETY: `is_available` was asserted above.
-            unsafe { loop_1_x8(a, &a_idx[lo..hi], b_src, &b_idx[lo..hi], &mut chains) };
+            unsafe { loop_1_x8(a, &a_idx[lo..hi], b_src.as_deref(), &b_idx[lo..hi], &mut chains) };
         } else {
             for (lane, k) in (lo..hi).enumerate() {
-                loop_1_scalar(a, a_idx[k], b_src, b_idx[k], lane, &mut chains, &half);
+                loop_1_scalar(a, a_idx[k], b_src.as_deref_mut(), b_idx[k], lane, &mut chains, &half);
             }
         }
     }
@@ -235,12 +249,13 @@ fn pair_add(a: &mut PointBuf, a_idx: &[usize], b_src: Option<&PointBuf>, b_idx: 
     for g in (0..groups).rev() {
         let lo = g * LANES;
         let hi = (lo + LANES).min(n);
-        if hi - lo == LANES && all_generic(a, a_idx, b_src, b_idx, lo) {
+        let generic = hi - lo == LANES && all_generic(a, a_idx, b_src.as_deref(), b_idx, lo);
+        if generic {
             // SAFETY: as above.
-            unsafe { loop_2_x8(a, &a_idx[lo..hi], b_src, &b_idx[lo..hi], &mut acc) };
+            unsafe { loop_2_x8(a, &a_idx[lo..hi], b_src.as_deref(), &b_idx[lo..hi], &mut acc) };
         } else {
             for (lane, k) in (lo..hi).enumerate() {
-                loop_2_scalar(a, a_idx[k], b_src, b_idx[k], lane, &mut acc);
+                loop_2_scalar(a, a_idx[k], b_src.as_deref(), b_idx[k], lane, &mut acc);
             }
         }
     }
@@ -347,13 +362,13 @@ unsafe fn loop_2_x8(
 fn loop_1_scalar(
     a: &mut PointBuf,
     ai: usize,
-    b_src: Option<&PointBuf>,
+    mut b_src: Option<&mut PointBuf>,
     bi: usize,
     lane: usize,
     chains: &mut Chains,
     half: &[u64; LIMBS],
 ) {
-    let (bx, by, binf) = match b_src {
+    let (bx, by, binf) = match &b_src {
         Some(b) => (b.x[bi], b.y[bi], b.infinity[bi]),
         None => (a.x[bi], a.y[bi], a.infinity[bi]),
     };
@@ -371,16 +386,23 @@ fn loop_1_scalar(
             a.x[ai] = add_ref(&by, &by);
             a.y[ai] = mont_mul_ref(&num, &chains.tmp[lane]);
             chains.tmp[lane] = mont_mul_ref(&chains.tmp[lane], &a.x[ai]);
-            // The scalar version writes these back through `b`; only the
-            // in-place phase can observe them.
-            if b_src.is_none() {
-                a.x[bi] = new_bx;
-                a.y[bi] = new_by;
+            // The second pass reads these back, so they must land wherever the
+            // b operand actually lives.
+            match &mut b_src {
+                Some(b) => {
+                    b.x[bi] = new_bx;
+                    b.y[bi] = new_by;
+                }
+                None => {
+                    a.x[bi] = new_bx;
+                    a.y[bi] = new_by;
+                }
             }
         } else {
             a.infinity[ai] = true;
-            if b_src.is_none() {
-                a.infinity[bi] = true;
+            match &mut b_src {
+                Some(b) => b.infinity[bi] = true,
+                None => a.infinity[bi] = true,
             }
         }
         return;
@@ -430,29 +452,57 @@ fn loop_2_scalar(
 fn batch_add_write(bases: &PointBuf, index: &[(u32, u32)], out: &mut PointBuf, scratch: &mut Scratch) {
     scratch.a_idx.clear();
     scratch.b_idx.clear();
+    scratch.b_buf.clear();
     for (idx, idy) in index.iter() {
         out.push_from_other(bases, *idx as usize);
         if *idy != !0u32 {
             scratch.a_idx.push(out.len() - 1);
-            scratch.b_idx.push(*idy as usize);
+            scratch.b_idx.push(scratch.b_buf.len());
+            scratch.b_buf.push_from_other(bases, *idy as usize);
         }
     }
-    let Scratch { a_idx, b_idx } = scratch;
-    pair_add(out, a_idx, Some(bases), b_idx);
+    let Scratch { a_idx, b_idx, b_buf } = scratch;
+    pair_add(out, a_idx, Some(b_buf), b_idx);
 }
 
-/// Batch size for the vectorized path.
+/// Batch size for the vectorized path, overridable via
+/// `SNARKVM_IFMA_BATCH_SIZE`.
 ///
-/// `batched::batch_size` divides the cache budget by 96 bytes, the size of a
-/// `G1Affine`. A point costs 128 bytes here, so the same element count no
-/// longer fits and the constant has to be re-derived.
-const fn ifma_batch_size(_msm_size: usize) -> usize {
-    // Swept against real MSMs on a Xeon w9-3475X at n = 2^18: 256 -> 2.01s,
-    // 512 -> 1.72s, 1024 -> 1.60s, 2048 -> 1.57s, 4096 -> 1.54s, 8192 -> 1.51s.
-    // The gain past 4096 is under 2%, and each pair touches two 128-byte points,
-    // so 4096 keeps the working set near 1 MiB rather than chasing the last
-    // percent off the end of L2.
-    4096
+/// This is a tuning knob, not a correctness one: it only sets how many
+/// additions share a single field inversion.
+///
+/// The default rests on one sweep, at n = 2^18, single threaded, on a Xeon
+/// w9-3475X, with the shipped scalar path measured alongside for reference.
+/// Absolute times move with machine state; the shape, and the value it picks
+/// out, held across re-runs:
+///
+/// ```text
+/// batch size    256     512    1024    2048    4096    8192
+/// ifma        2.009   1.720   1.604   1.570   1.543   1.512
+/// scalar         --   1.942   1.849   1.764   1.714      --
+///
+/// scalar, as shipped (batch size 300): 2.043
+/// ```
+///
+/// Note that the scalar path has the same shape, so the sensitivity is not an
+/// artifact of the wider representation used here: both pay one field
+/// inversion per call, which only amortizes with batch size.
+///
+/// 4096 is picked because the gain past it is under 2% while each pair touches
+/// two 128-byte points, which keeps the working set near 1 MiB rather than
+/// running off the end of L2. That basis is much narrower than the one behind
+/// `batched::batch_size`, which was tuned across Intel, AMD and M1, so the
+/// value is left adjustable until it has been measured on more hardware.
+fn ifma_batch_size() -> usize {
+    const DEFAULT: usize = 4096;
+    static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        std::env::var("SNARKVM_IFMA_BATCH_SIZE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT)
+    })
 }
 
 /// Mirrors `batched::batch_add` for BLS12-377 G1.
@@ -460,7 +510,7 @@ pub fn batch_add(num_buckets: usize, bases_ifma: &PointBuf, bucket_positions: &m
     assert!(bases_ifma.len() >= bucket_positions.len());
     assert!(!bases_ifma.is_empty());
 
-    let batch_size = ifma_batch_size(bases_ifma.len());
+    let batch_size = ifma_batch_size();
     bucket_positions.sort_unstable();
 
     let mut num_scalars = bucket_positions.len();
@@ -593,7 +643,7 @@ pub fn batch_add(num_buckets: usize, bases_ifma: &PointBuf, bucket_positions: &m
 #[cfg(test)]
 mod tests {
     use super::*;
-    use snarkvm_curves::{AffineCurve, ProjectiveCurve};
+    use snarkvm_curves::{AffineCurve, ProjectiveCurve, bls12_377::Fr};
     use snarkvm_utilities::{TestRng, Uniform};
 
     /// The scalar batch addition from `batched.rs`, reproduced so the
@@ -827,6 +877,279 @@ mod tests {
             prev = (pairs as f64, best);
         }
         let _ = buf0.len();
+    }
+
+    /// A frozen test vector for the write path.
+    ///
+    /// Bases are given as multiples of the prime-order generator, so both the
+    /// inputs and the expected outputs stay readable and can be checked by
+    /// hand: `[i]G + [j]G` must be `[i + j]G`. `0` denotes the point at
+    /// infinity, and a negative entry denotes `-[k]G`.
+    struct Vector {
+        /// The edge case this vector pins down.
+        what: &'static str,
+        /// Bases, as generator multiples.
+        bases: &'static [i64],
+        /// Index pairs into `bases`. A second element of `NOOP` is the `!0`
+        /// sentinel the caller uses for a bucket holding an odd count.
+        index: &'static [(u32, u32)],
+        /// Expected result per index entry, as a generator multiple. Produced
+        /// by running the scalar algorithm; see `regenerate_test_vectors`.
+        expect: &'static [i64],
+    }
+
+    const NOOP: u32 = !0u32;
+
+    /// Concrete cases, each pinning one thing the vectorized path has to agree
+    /// with the scalar one about.
+    const VECTORS: &[Vector] = &[
+        Vector {
+            what: "a single generic pair: distinct x, the plain chord case",
+            bases: &[1, 2],
+            index: &[(0, 1)],
+            expect: &[3],
+        },
+        Vector {
+            what: "odd bucket count: a trailing NOOP entry is copied, not added",
+            bases: &[1, 2, 5],
+            index: &[(0, 1), (2, NOOP)],
+            expect: &[3, 5],
+        },
+        Vector {
+            what: "duplicate points: takes the doubling branch, which mutates the b operand and must carry that into the second pass",
+            bases: &[3, 3],
+            index: &[(0, 1)],
+            expect: &[6],
+        },
+        Vector {
+            what: "a at infinity: the second pass copies b over a",
+            bases: &[0, 7],
+            index: &[(0, 1)],
+            expect: &[7],
+        },
+        Vector { what: "b at infinity: a passes through untouched", bases: &[7, 0], index: &[(0, 1)], expect: &[7] },
+        Vector { what: "both at infinity: stays at infinity", bases: &[0, 0], index: &[(0, 1)], expect: &[0] },
+        Vector {
+            what: "P + (-P): equal x, opposite y, so both operands go to infinity",
+            bases: &[9, -9],
+            index: &[(0, 1)],
+            expect: &[0],
+        },
+        Vector {
+            what: "exactly one full lane group: eight generic pairs, the vectorized path with no scalar tail",
+            bases: &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+            index: &[(0, 1), (2, 3), (4, 5), (6, 7), (8, 9), (10, 11), (12, 13), (14, 15)],
+            expect: &[3, 7, 11, 15, 19, 23, 27, 31],
+        },
+        Vector {
+            what: "one full group plus a one-pair tail: exercises the scalar remainder path alongside the vectorized one",
+            bases: &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18],
+            index: &[(0, 1), (2, 3), (4, 5), (6, 7), (8, 9), (10, 11), (12, 13), (14, 15), (16, 17)],
+            expect: &[3, 7, 11, 15, 19, 23, 27, 31, 35],
+        },
+        Vector {
+            what: "a doubling inside an otherwise generic group: one degenerate lane sends the whole group down the scalar path",
+            bases: &[1, 2, 3, 4, 5, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+            index: &[(0, 1), (2, 3), (4, 5), (6, 7), (8, 9), (10, 11), (12, 13), (14, 15)],
+            expect: &[3, 7, 10, 15, 19, 23, 27, 31],
+        },
+        Vector {
+            what: "doublings straddling a group boundary: last lane of group 0 and first lane of group 1",
+            bases: &[
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 6, 6, 8, 8, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
+                30, 31, 32,
+            ],
+            index: &[
+                (0, 1),
+                (2, 3),
+                (4, 5),
+                (6, 7),
+                (8, 9),
+                (10, 11),
+                (12, 13),
+                (14, 15),
+                (16, 17),
+                (18, 19),
+                (20, 21),
+                (22, 23),
+                (24, 25),
+                (26, 27),
+                (28, 29),
+                (30, 31),
+            ],
+            expect: &[3, 7, 11, 15, 19, 23, 27, 12, 16, 39, 43, 47, 51, 55, 59, 63],
+        },
+        Vector {
+            what: "a doubling, an infinity and a negation together in one group",
+            bases: &[1, 2, 4, 4, 0, 6, 7, -7, 9, 10, 11, 12, 13, 14, 15, 16],
+            index: &[(0, 1), (2, 3), (4, 5), (6, 7), (8, 9), (10, 11), (12, 13), (14, 15)],
+            expect: &[3, 8, 6, 0, 19, 23, 27, 31],
+        },
+        Vector {
+            what: "every pair a doubling: no lane ever takes the vector path",
+            bases: &[2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9],
+            index: &[(0, 1), (2, 3), (4, 5), (6, 7), (8, 9), (10, 11), (12, 13), (14, 15)],
+            expect: &[4, 6, 8, 10, 12, 14, 16, 18],
+        },
+        Vector {
+            what: "NOOP entries interleaved through a full group, so the pair list and the output list have different lengths",
+            bases: &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            index: &[(0, 1), (2, NOOP), (3, 4), (5, NOOP), (6, 7), (8, 9)],
+            expect: &[3, 3, 9, 6, 15, 19],
+        },
+    ];
+
+    /// Builds `[k]G`, with `0` meaning the point at infinity.
+    fn multiple(k: i64) -> G1Affine {
+        if k == 0 {
+            return G1Affine::zero();
+        }
+        let g = G1Affine::prime_subgroup_generator().to_projective();
+        let p = (g * Fr::from(k.unsigned_abs())).to_affine();
+        if k < 0 { -p } else { p }
+    }
+
+    #[test]
+    fn test_frozen_vectors_match_scalar_answers() {
+        if !ifma::is_available() {
+            eprintln!("skipping: CPU lacks AVX512-IFMA");
+            return;
+        }
+        for v in VECTORS {
+            let points: Vec<G1Affine> = v.bases.iter().map(|k| multiple(*k)).collect();
+            let bases = PointBuf::from_affine(&points);
+            let mut out = PointBuf::with_capacity(v.index.len());
+            let mut scratch = Scratch::with_capacity(v.index.len());
+            batch_add_write(&bases, v.index, &mut out, &mut scratch);
+
+            assert_eq!(out.len(), v.expect.len(), "{}", v.what);
+            for (k, want) in v.expect.iter().enumerate() {
+                let got = out.get(k);
+                let expected = multiple(*want);
+                // For a result at infinity only the flag is meaningful: the
+                // coordinates left behind are never read, because every
+                // consumer short-circuits on `is_zero`.
+                if expected.is_zero() {
+                    assert!(got.is_zero(), "{}: entry {k} should be infinity, got {got}", v.what);
+                } else {
+                    assert_eq!(got, expected, "{}: entry {k}", v.what);
+                }
+            }
+        }
+    }
+
+    /// Recomputes the `expect` fields from the scalar algorithm and prints
+    /// them. Run this if the vectors ever need regenerating:
+    /// `cargo test -p snarkvm-algorithms --release regenerate_test_vectors --
+    /// --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn regenerate_test_vectors() {
+        // Enough multiples of G to name any sum these vectors can produce.
+        let mut table = std::collections::HashMap::new();
+        for k in -128i64..=128 {
+            table.insert(multiple(k).to_string(), k);
+        }
+        for v in VECTORS {
+            let points: Vec<G1Affine> = v.bases.iter().map(|k| multiple(*k)).collect();
+            let got = scalar_batch_add_write(&points, v.index);
+            let named: Vec<String> = got
+                .iter()
+                .map(|p| match table.get(&p.to_string()) {
+                    Some(k) => k.to_string(),
+                    None if p.is_zero() => "0".to_string(),
+                    None => format!("<unknown point {p}>"),
+                })
+                .collect();
+            println!("  // {}", v.what);
+            println!("  expect: &[{}],", named.join(", "));
+        }
+    }
+
+    /// `batched::batch_add_write`, reproduced so the write path can be compared
+    /// directly. Note that it saves the *mutated* `b` for the second pass.
+    fn scalar_batch_add_write(bases: &[G1Affine], index: &[(u32, u32)]) -> Vec<G1Affine> {
+        let mut inversion_tmp = Fq::one();
+        let half = Fq::half();
+        let mut out: Vec<G1Affine> = Vec::with_capacity(index.len());
+        let mut scratch: Vec<Option<G1Affine>> = Vec::with_capacity(index.len());
+        for (idx, idy) in index.iter() {
+            if *idy == !0u32 {
+                out.push(bases[*idx as usize]);
+                scratch.push(None);
+            } else {
+                let (mut a, mut b) = (bases[*idx as usize], bases[*idy as usize]);
+                G1Affine::batch_add_loop_1(&mut a, &mut b, &half, &mut inversion_tmp);
+                out.push(a);
+                scratch.push(Some(b));
+            }
+        }
+        inversion_tmp = inversion_tmp.inverse().unwrap();
+        for (a, op_b) in out.iter_mut().rev().zip(scratch.iter().rev()) {
+            if let Some(b) = op_b {
+                G1Affine::batch_add_loop_2(a, *b, &mut inversion_tmp);
+            }
+        }
+        out
+    }
+
+    fn run_write_case(rng: &mut TestRng, mutate: impl Fn(&mut Vec<G1Affine>)) {
+        if !ifma::is_available() {
+            return;
+        }
+        let n_pairs = 40usize;
+        let mut points: Vec<G1Affine> = (0..2 * n_pairs).map(|_| G1Affine::rand(rng)).collect();
+        mutate(&mut points);
+        // Interleave a few no-op entries, as the real caller does for buckets
+        // holding an odd number of points.
+        let mut index: Vec<(u32, u32)> = Vec::new();
+        for k in 0..n_pairs {
+            if k % 7 == 3 {
+                index.push((2 * k as u32, !0u32));
+            } else {
+                index.push((2 * k as u32, 2 * k as u32 + 1));
+            }
+        }
+
+        let expected = scalar_batch_add_write(&points, &index);
+
+        let bases = PointBuf::from_affine(&points);
+        let mut out = PointBuf::with_capacity(index.len());
+        let mut scratch = Scratch::with_capacity(index.len());
+        batch_add_write(&bases, &index, &mut out, &mut scratch);
+
+        for (k, want) in expected.iter().enumerate() {
+            assert_eq!(out.get(k), *want, "entry {k}");
+        }
+    }
+
+    #[test]
+    fn test_write_path_matches_scalar_generic() {
+        let mut rng = TestRng::default();
+        run_write_case(&mut rng, |_| {});
+    }
+
+    #[test]
+    fn test_write_path_matches_scalar_with_doublings() {
+        // The doubling branch mutates the b operand and the second pass reads
+        // that mutation back, which the write path has to preserve.
+        let mut rng = TestRng::default();
+        run_write_case(&mut rng, |points| {
+            points[1] = points[0];
+            points[11] = points[10];
+            points[65] = points[64];
+        });
+    }
+
+    #[test]
+    fn test_write_path_matches_scalar_with_infinities_and_negations() {
+        let mut rng = TestRng::default();
+        run_write_case(&mut rng, |points| {
+            points[4] = G1Affine::zero();
+            points[9] = G1Affine::zero();
+            points[13] = -points[12];
+            points[21] = -points[20];
+        });
     }
 
     #[test]

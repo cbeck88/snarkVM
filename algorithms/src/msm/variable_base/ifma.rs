@@ -97,17 +97,18 @@ pub fn is_available() -> bool {
     })
 }
 
-/// Whether the MSM should actually dispatch to the vectorized path.
+/// Whether the MSM should dispatch to the vectorized path.
 ///
-/// Off unless `SNARKVM_ENABLE_AVX512_IFMA` is set. The kernel itself is
-/// measurably faster than the scalar one, but the wired path is not yet a net
-/// win end to end -- see the `ifma_batch_add` module docs -- so it stays opt-in
-/// until that is closed. Correctness does not depend on this switch: both paths
-/// produce identical results, which the tests check.
+/// On wherever the CPU supports it. Setting `SNARKVM_DISABLE_AVX512_IFMA`
+/// forces the scalar path, as an operator kill switch and for A/B measurement.
+///
+/// Correctness does not depend on this switch. Both paths produce identical
+/// field elements, so two nodes that answer differently here still agree on
+/// every result; the tests check that against the scalar path directly.
 #[inline]
 pub fn is_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| is_available() && std::env::var_os("SNARKVM_ENABLE_AVX512_IFMA").is_some())
+    *ENABLED.get_or_init(|| is_available() && std::env::var_os("SNARKVM_DISABLE_AVX512_IFMA").is_none())
 }
 
 // ---------------------------------------------------------------------------
