@@ -33,7 +33,7 @@
 #![allow(unsafe_code)]
 
 use snarkvm_curves::bls12_377::{Fq, FqParameters};
-use snarkvm_fields::Fp384;
+use snarkvm_fields::{FieldParameters, Fp384};
 use snarkvm_utilities::BigInteger384;
 
 /// The number of field elements processed per vector operation.
@@ -117,9 +117,10 @@ pub fn is_enabled() -> bool {
 /// Regroups a 384-bit little-endian value from six 64-bit limbs into eight
 /// 52-bit limbs.
 #[inline]
-fn regroup_64_to_52(x: &[u64; 6]) -> [u64; LIMBS] {
+const fn regroup_64_to_52(x: &[u64; 6]) -> [u64; LIMBS] {
     let mut out = [0u64; LIMBS];
-    for (i, o) in out.iter_mut().enumerate() {
+    let mut i = 0;
+    while i < LIMBS {
         let start = i * 52;
         let word = start / 64;
         let shift = start % 64;
@@ -129,7 +130,8 @@ fn regroup_64_to_52(x: &[u64; 6]) -> [u64; LIMBS] {
         if shift > 12 && word + 1 < 6 {
             v |= x[word + 1] << (64 - shift);
         }
-        *o = v & MASK;
+        out[i] = v & MASK;
+        i += 1;
     }
     out
 }
@@ -158,50 +160,61 @@ fn regroup_52_to_64(x: &[u64; LIMBS]) -> [u64; 6] {
 // ---------------------------------------------------------------------------
 
 /// CIOS Montgomery multiplication in radix 2^52, returning a canonical result.
-pub fn mont_mul_ref(a: &[u64; LIMBS], b: &[u64; LIMBS]) -> [u64; LIMBS] {
+pub const fn mont_mul_ref(a: &[u64; LIMBS], b: &[u64; LIMBS]) -> [u64; LIMBS] {
     let mut t = [0u64; LIMBS + 1];
-    for &bi in b.iter() {
+    let mut i = 0;
+    while i < LIMBS {
         let mut carry = 0u64;
-        for j in 0..LIMBS {
-            let prod = (a[j] as u128) * (bi as u128) + (t[j] as u128) + (carry as u128);
+        let mut j = 0;
+        while j < LIMBS {
+            let prod = (a[j] as u128) * (b[i] as u128) + (t[j] as u128) + (carry as u128);
             t[j] = (prod as u64) & MASK;
             carry = (prod >> 52) as u64;
+            j += 1;
         }
         t[LIMBS] += carry;
 
         let m = t[0].wrapping_mul(N0INV) & MASK;
         let mut carry = 0u64;
-        for j in 0..LIMBS {
+        let mut j = 0;
+        while j < LIMBS {
             let prod = (m as u128) * (P[j] as u128) + (t[j] as u128) + (carry as u128);
             t[j] = (prod as u64) & MASK;
             carry = (prod >> 52) as u64;
+            j += 1;
         }
-        debug_assert_eq!(t[0], 0);
-        for j in 0..LIMBS {
+        debug_assert!(t[0] == 0);
+        let mut j = 0;
+        while j < LIMBS {
             t[j] = t[j + 1];
+            j += 1;
         }
         t[LIMBS] = 0;
         t[LIMBS - 1] = t[LIMBS - 1].wrapping_add(carry);
+        i += 1;
     }
     let mut out = [0u64; LIMBS];
-    out.copy_from_slice(&t[..LIMBS]);
-    sub_p_if_ge(&mut out);
-    out
+    let mut j = 0;
+    while j < LIMBS {
+        out[j] = t[j];
+        j += 1;
+    }
+    sub_p_if_ge(out)
 }
 
 /// Subtracts `P` from `x` if `x >= P`, leaving a canonical representative.
 #[inline]
-fn sub_p_if_ge(x: &mut [u64; LIMBS]) {
+const fn sub_p_if_ge(x: [u64; LIMBS]) -> [u64; LIMBS] {
     let mut d = [0u64; LIMBS];
-    let mut borrow = 0u64;
-    for j in 0..LIMBS {
-        let v = (x[j] as i128) - (P[j] as i128) - (borrow as i128);
+    let mut borrow = 0i128;
+    let mut j = 0;
+    while j < LIMBS {
+        let v = (x[j] as i128) - (P[j] as i128) - borrow;
         d[j] = (v as u64) & MASK;
-        borrow = u64::from(v < 0);
+        borrow = (v < 0) as i128;
+        j += 1;
     }
-    if borrow == 0 {
-        *x = d;
-    }
+    if borrow == 0 { d } else { x }
 }
 
 /// Adds `P` to `x`. Used to correct an underflowed subtraction.
@@ -224,8 +237,7 @@ pub fn add_ref(a: &[u64; LIMBS], b: &[u64; LIMBS]) -> [u64; LIMBS] {
         out[j] = v & MASK;
         carry = v >> 52;
     }
-    sub_p_if_ge(&mut out);
-    out
+    sub_p_if_ge(out)
 }
 
 /// Modular subtraction of canonical inputs.
@@ -253,8 +265,42 @@ pub fn regroup_raw(x: &Fq) -> [u64; LIMBS] {
 
 /// Finishes the conversion started by [`regroup_raw`], one element at a time.
 #[inline]
-pub fn shift_into_domain(raw: &[u64; LIMBS]) -> [u64; LIMBS] {
+pub const fn shift_into_domain(raw: &[u64; LIMBS]) -> [u64; LIMBS] {
     mont_mul_ref(raw, &TO_IFMA)
+}
+
+/// The field element one, in this domain. Derived at compile time from the
+/// scalar field's own `R`, so it cannot drift from the curve parameters.
+pub const ONE: [u64; LIMBS] = shift_into_domain(&regroup_64_to_52(&FqParameters::R.0));
+
+/// The field element one half, in this domain.
+///
+/// Montgomery representation is linear in the value it stands for, so halving
+/// the representative halves the field element.
+pub const HALF: [u64; LIMBS] = half_of(&ONE);
+
+/// Halves a canonical value modulo `P`. Adding `P` to an odd value makes it
+/// even without changing what it represents, so the shift stays exact.
+const fn half_of(v: &[u64; LIMBS]) -> [u64; LIMBS] {
+    let mut t = *v;
+    if t[0] & 1 == 1 {
+        let mut carry = 0u64;
+        let mut j = 0;
+        while j < LIMBS {
+            let sum = t[j] + P[j] + carry;
+            t[j] = sum & MASK;
+            carry = sum >> 52;
+            j += 1;
+        }
+    }
+    let mut out = [0u64; LIMBS];
+    let mut j = 0;
+    while j < LIMBS {
+        let carry_in = if j + 1 < LIMBS { t[j + 1] & 1 } else { 0 };
+        out[j] = (t[j] >> 1) | (carry_in << 51);
+        j += 1;
+    }
+    out
 }
 
 /// Converts a scalar `Fq` into this backend's Montgomery domain.
@@ -267,6 +313,34 @@ pub fn from_ifma(x: &[u64; LIMBS]) -> Fq {
     // Shifting by `FROM_IFMA` lands directly on the scalar Montgomery form, so
     // the result can be rebuilt without a second conversion.
     Fp384::<FqParameters>(BigInteger384(regroup_52_to_64(&mont_mul_ref(x, &FROM_IFMA))), core::marker::PhantomData)
+}
+
+/// Converts eight elements out of the domain at once.
+///
+/// The per-element scalar path costs a full 8-limb Montgomery multiply, which
+/// is far more expensive than the native 6-limb one; doing the shift eight at a
+/// time keeps it off the critical path.
+pub fn from_ifma_x8(x: &[[u64; LIMBS]; LANES]) -> [Fq; LANES] {
+    if is_available() {
+        // SAFETY: guarded by `is_available`.
+        let raw = unsafe { mul_x8(&Fq8::load(x), &Fq8::load(&[FROM_IFMA; LANES])).store() };
+        std::array::from_fn(|l| {
+            Fp384::<FqParameters>(BigInteger384(regroup_52_to_64(&raw[l])), core::marker::PhantomData)
+        })
+    } else {
+        std::array::from_fn(|l| from_ifma(&x[l]))
+    }
+}
+
+/// Converts eight elements into the domain at once.
+pub fn to_ifma_x8(x: &[Fq; LANES]) -> [[u64; LIMBS]; LANES] {
+    let raw: [[u64; LIMBS]; LANES] = std::array::from_fn(|l| regroup_raw(&x[l]));
+    if is_available() {
+        // SAFETY: guarded by `is_available`.
+        unsafe { mul_x8(&Fq8::load(&raw), &Fq8::load(&[TO_IFMA; LANES])).store() }
+    } else {
+        std::array::from_fn(|l| shift_into_domain(&raw[l]))
+    }
 }
 
 /// Moves a whole slice into the domain in place, eight elements at a time.
@@ -525,6 +599,38 @@ mod tests {
         }
         assert_eq!(from_ifma(&to_ifma(&Fq::zero())), Fq::zero());
         assert_eq!(from_ifma(&to_ifma(&Fq::one())), Fq::one());
+    }
+
+    #[test]
+    fn test_domain_constants() {
+        // Derived at compile time; check them against the runtime conversion
+        // and against their closed forms, 2^416 and 2^415 mod P.
+        assert_eq!(ONE, to_ifma(&Fq::one()));
+        assert_eq!(HALF, to_ifma(&<Fq as snarkvm_fields::Field>::half()));
+        assert_eq!(ONE, [
+            0x33f67abdcbccf,
+            0x13a714cde2ff1,
+            0x80ef04efd57bd,
+            0x68acd5a37c3a6,
+            0x8c63c8655a9bd,
+            0x7b4891129d194,
+            0xb78d3aa6ef92f,
+            0x0000000000028
+        ]);
+        assert_eq!(HALF, [
+            0xdffb3d5ee5e68,
+            0x2beb8a66f1c20,
+            0x10c1c278a318d,
+            0x3e1dfa4b6f351,
+            0x1f02fb0245559,
+            0xdb2728bf9f314,
+            0x2df75b7bff1fa,
+            0x0000000000d86
+        ]);
+        assert_eq!(add_ref(&HALF, &HALF), ONE);
+        // `ONE` really is the multiplicative identity in this domain.
+        let x = to_ifma(&Fq::from(123456789u64));
+        assert_eq!(mont_mul_ref(&x, &ONE), x);
     }
 
     #[test]

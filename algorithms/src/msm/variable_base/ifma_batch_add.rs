@@ -135,40 +135,67 @@ struct Chains {
 }
 
 impl Chains {
-    fn new(one: &[u64; LIMBS]) -> Self {
-        Self { tmp: [*one; LANES] }
+    fn new() -> Self {
+        Self { tmp: [ifma::ONE; LANES] }
     }
 
     /// Folds the eight chain products into a single inversion, then hands each
     /// lane back the inverse of its own product.
+    ///
+    /// The fold runs in the native field: it is only ~24 multiplies, but an
+    /// 8-limb multiply in this domain costs far more than a native one, and the
+    /// two domain shifts are a single vector operation each.
     fn invert(&self) -> [[u64; LIMBS]; LANES] {
-        // prefix[l] is the product of chains strictly before l.
-        let one = to_ifma(&Fq::one());
-        let mut prefix = [one; LANES];
-        for l in 1..LANES {
-            prefix[l] = mont_mul_ref(&prefix[l - 1], &self.tmp[l - 1]);
-        }
-        let total = mont_mul_ref(&prefix[LANES - 1], &self.tmp[LANES - 1]);
-        // A single inversion for the entire batch. `total` is a product of
-        // nonzero denominators, so it is invertible.
-        let inv_total = to_ifma(&from_ifma(&total).inverse().expect("batch denominator is nonzero"));
+        let t = ifma::from_ifma_x8(&self.tmp);
 
-        let mut out = [one; LANES];
-        let mut suffix = one;
-        for l in (0..LANES).rev() {
-            out[l] = mont_mul_ref(&mont_mul_ref(&inv_total, &prefix[l]), &suffix);
-            suffix = mont_mul_ref(&suffix, &self.tmp[l]);
+        // prefix[l] is the product of every chain strictly before l.
+        let mut prefix = [Fq::one(); LANES];
+        for l in 1..LANES {
+            prefix[l] = prefix[l - 1] * t[l - 1];
         }
-        out
+        // One inversion for the whole batch; the chains hold products of
+        // nonzero denominators, so this cannot fail.
+        let inv_total = (prefix[LANES - 1] * t[LANES - 1]).inverse().expect("batch denominator is nonzero");
+
+        let mut out = [Fq::one(); LANES];
+        let mut suffix = Fq::one();
+        for l in (0..LANES).rev() {
+            out[l] = inv_total * prefix[l] * suffix;
+            suffix *= t[l];
+        }
+        ifma::to_ifma_x8(&out)
     }
 }
 
 /// For each `(i, j)` in `index`, sets point `i` to `point i + point j`. The
 /// state of point `j` becomes unspecified, matching the scalar version.
 pub fn batch_add_in_place(buf: &mut PointBuf, index: &[(u32, u32)]) {
-    let a_idx: Vec<usize> = index.iter().map(|(i, _)| *i as usize).collect();
-    let b_idx: Vec<usize> = index.iter().map(|(_, j)| *j as usize).collect();
-    pair_add(buf, &a_idx, None, &b_idx);
+    let mut scratch = Scratch::with_capacity(index.len());
+    batch_add_in_place_with(buf, index, &mut scratch);
+}
+
+/// Reusable index buffers, so `pair_add` does not allocate per call.
+#[derive(Default)]
+pub struct Scratch {
+    a_idx: Vec<usize>,
+    b_idx: Vec<usize>,
+}
+
+impl Scratch {
+    /// Creates scratch sized for a batch of `capacity` pairs.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self { a_idx: Vec::with_capacity(capacity), b_idx: Vec::with_capacity(capacity) }
+    }
+}
+
+/// As [`batch_add_in_place`], reusing the caller's scratch.
+pub fn batch_add_in_place_with(buf: &mut PointBuf, index: &[(u32, u32)], scratch: &mut Scratch) {
+    scratch.a_idx.clear();
+    scratch.b_idx.clear();
+    scratch.a_idx.extend(index.iter().map(|(i, _)| *i as usize));
+    scratch.b_idx.extend(index.iter().map(|(_, j)| *j as usize));
+    let Scratch { a_idx, b_idx } = scratch;
+    pair_add(buf, a_idx, None, b_idx);
 }
 
 /// Adds `b[b_idx[k]]` into `a[a_idx[k]]` for every `k`, over one batch
@@ -184,9 +211,8 @@ fn pair_add(a: &mut PointBuf, a_idx: &[usize], b_src: Option<&PointBuf>, b_idx: 
     }
     debug_assert!(ifma::is_available());
 
-    let one = to_ifma(&Fq::one());
-    let half = to_ifma(&Fq::half());
-    let mut chains = Chains::new(&one);
+    let half = ifma::HALF;
+    let mut chains = Chains::new();
 
     let n = a_idx.len();
     let groups = n.div_ceil(LANES);
@@ -401,17 +427,32 @@ fn loop_2_scalar(
 /// Mirrors `batched::batch_add_write`: for each `(i, j)` writes `bases[i] +
 /// bases[j]` (or just `bases[i]` when `j` is the `!0` sentinel) onto the end of
 /// `out`.
-fn batch_add_write(bases: &PointBuf, index: &[(u32, u32)], out: &mut PointBuf) {
-    let mut a_idx: Vec<usize> = Vec::with_capacity(index.len());
-    let mut b_idx: Vec<usize> = Vec::with_capacity(index.len());
+fn batch_add_write(bases: &PointBuf, index: &[(u32, u32)], out: &mut PointBuf, scratch: &mut Scratch) {
+    scratch.a_idx.clear();
+    scratch.b_idx.clear();
     for (idx, idy) in index.iter() {
         out.push_from_other(bases, *idx as usize);
         if *idy != !0u32 {
-            a_idx.push(out.len() - 1);
-            b_idx.push(*idy as usize);
+            scratch.a_idx.push(out.len() - 1);
+            scratch.b_idx.push(*idy as usize);
         }
     }
-    pair_add(out, &a_idx, Some(bases), &b_idx);
+    let Scratch { a_idx, b_idx } = scratch;
+    pair_add(out, a_idx, Some(bases), b_idx);
+}
+
+/// Batch size for the vectorized path.
+///
+/// `batched::batch_size` divides the cache budget by 96 bytes, the size of a
+/// `G1Affine`. A point costs 128 bytes here, so the same element count no
+/// longer fits and the constant has to be re-derived.
+const fn ifma_batch_size(_msm_size: usize) -> usize {
+    // Swept against real MSMs on a Xeon w9-3475X at n = 2^18: 256 -> 2.01s,
+    // 512 -> 1.72s, 1024 -> 1.60s, 2048 -> 1.57s, 4096 -> 1.54s, 8192 -> 1.51s.
+    // The gain past 4096 is under 2%, and each pair touches two 128-byte points,
+    // so 4096 keeps the working set near 1 MiB rather than chasing the last
+    // percent off the end of L2.
+    4096
 }
 
 /// Mirrors `batched::batch_add` for BLS12-377 G1.
@@ -419,7 +460,7 @@ pub fn batch_add(num_buckets: usize, bases_ifma: &PointBuf, bucket_positions: &m
     assert!(bases_ifma.len() >= bucket_positions.len());
     assert!(!bases_ifma.is_empty());
 
-    let batch_size = super::batched::batch_size(bases_ifma.len());
+    let batch_size = ifma_batch_size(bases_ifma.len());
     bucket_positions.sort_unstable();
 
     let mut num_scalars = bucket_positions.len();
@@ -431,6 +472,7 @@ pub fn batch_add(num_buckets: usize, bases_ifma: &PointBuf, bucket_positions: &m
 
     let mut instr = Vec::<(u32, u32)>::with_capacity(batch_size);
     let mut new_bases = PointBuf::with_capacity(bases_ifma.len());
+    let mut scratch = Scratch::with_capacity(batch_size);
 
     while global_counter < num_scalars {
         let current_bucket = bucket_positions[global_counter].bucket_index;
@@ -464,7 +506,7 @@ pub fn batch_add(num_buckets: usize, bases_ifma: &PointBuf, bucket_positions: &m
             local_counter = 1;
 
             if number_of_bases_in_batch >= batch_size / 2 {
-                batch_add_write(bases_ifma, &instr, &mut new_bases);
+                batch_add_write(bases_ifma, &instr, &mut new_bases, &mut scratch);
                 instr.clear();
                 number_of_bases_in_batch = 0;
             }
@@ -477,7 +519,7 @@ pub fn batch_add(num_buckets: usize, bases_ifma: &PointBuf, bucket_positions: &m
         global_counter += 1;
     }
     if !instr.is_empty() {
-        batch_add_write(bases_ifma, &instr, &mut new_bases);
+        batch_add_write(bases_ifma, &instr, &mut new_bases, &mut scratch);
         instr.clear();
     }
     global_counter = 0;
@@ -520,7 +562,7 @@ pub fn batch_add(num_buckets: usize, bases_ifma: &PointBuf, bucket_positions: &m
                 local_counter = 1;
 
                 if number_of_bases_in_batch >= batch_size / 2 {
-                    batch_add_in_place(&mut new_bases, &instr);
+                    batch_add_in_place_with(&mut new_bases, &instr, &mut scratch);
                     instr.clear();
                     number_of_bases_in_batch = 0;
                 }
@@ -531,7 +573,7 @@ pub fn batch_add(num_buckets: usize, bases_ifma: &PointBuf, bucket_positions: &m
             global_counter += 1;
         }
         if !instr.is_empty() {
-            batch_add_in_place(&mut new_bases, &instr);
+            batch_add_in_place_with(&mut new_bases, &instr, &mut scratch);
             instr.clear();
         }
         global_counter = 0;
@@ -731,10 +773,11 @@ mod tests {
         let mut best_write = f64::MAX;
         for _ in 0..7 {
             let mut out = PointBuf::with_capacity(n_pairs);
+            let mut scratch = Scratch::with_capacity(n_pairs);
             let t = Instant::now();
             for _ in 0..reps {
                 out.clear();
-                batch_add_write(&bases, &index, &mut out);
+                batch_add_write(&bases, &index, &mut out, &mut scratch);
                 std::hint::black_box(out.len());
             }
             best_write = best_write.min(t.elapsed().as_nanos() as f64 / (reps * n_pairs) as f64);
@@ -747,6 +790,43 @@ mod tests {
             "  ifma batch_add_write          : {best_write:>7.1} ns/pair  ({:.2}x)",
             (best_scalar - clone_cost) / best_write
         );
+    }
+
+    /// Isolates the fixed per-call cost of `pair_add` from its per-pair cost.
+    #[test]
+    #[ignore]
+    fn bench_per_call_overhead() {
+        use std::time::Instant;
+        if !ifma::is_available() {
+            return;
+        }
+        let mut rng = TestRng::default();
+        let points: Vec<G1Affine> = (0..40_000).map(|_| G1Affine::rand(&mut rng)).collect();
+        let buf0 = PointBuf::from_affine(&points);
+        println!("  pairs/call   ns/pair");
+        let mut prev = (0f64, 0f64);
+        for pairs in [8usize, 32, 128, 512, 2048, 8192] {
+            let index: Vec<(u32, u32)> = (0..pairs).map(|k| (2 * k as u32, 2 * k as u32 + 1)).collect();
+            let reps = (65_536 / pairs).max(1);
+            let mut best = f64::MAX;
+            for _ in 0..5 {
+                let mut buf = PointBuf::from_affine(&points[..2 * pairs]);
+                let t = Instant::now();
+                for _ in 0..reps {
+                    batch_add_in_place(&mut buf, &index);
+                }
+                std::hint::black_box(buf.len());
+                best = best.min(t.elapsed().as_nanos() as f64 / (reps * pairs) as f64);
+            }
+            println!("  {pairs:>8}   {best:>7.1}");
+            if prev.0 > 0.0 {
+                // Two points on ns/pair = per_pair + fixed/pairs give the split.
+                let fixed = (prev.1 - best) / (1.0 / prev.0 - 1.0 / pairs as f64);
+                println!("           -> implied fixed cost per call: {:.0} ns", fixed);
+            }
+            prev = (pairs as f64, best);
+        }
+        let _ = buf0.len();
     }
 
     #[test]
