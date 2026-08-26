@@ -14,6 +14,7 @@
 // limitations under the License.
 
 use super::*;
+use crate::MAX_EAGER_RESERVE;
 
 impl<N: Network> FromBytes for ClosureCore<N> {
     /// Reads the closure from a buffer.
@@ -43,7 +44,7 @@ impl<N: Network> FromBytes for ClosureCore<N> {
         if num_instructions > u32::try_from(N::MAX_INSTRUCTIONS).map_err(error)? {
             return Err(error(format!("Failed to deserialize a closure: too many instructions ({num_instructions})")));
         }
-        let mut instructions = Vec::with_capacity(num_instructions as usize);
+        let mut instructions = Vec::with_capacity((num_instructions as usize).min(MAX_EAGER_RESERVE));
         for _ in 0..num_instructions {
             instructions.push(Instruction::read_le(&mut reader)?);
         }
@@ -145,6 +146,29 @@ closure main:
         let expected_bytes = expected.to_bytes_le()?;
         println!("String size: {:?}, Bytecode size: {:?}", closure_string.len(), expected_bytes.len());
 
+        let candidate = Closure::<CurrentNetwork>::from_bytes_le(&expected_bytes)?;
+        assert_eq!(expected.to_string(), candidate.to_string());
+        assert_eq!(expected_bytes, candidate.to_bytes_le()?);
+        Ok(())
+    }
+
+    /// The deserializer reserves space for a bounded number of instructions up front, so a closure
+    /// carrying more than that has to keep reading correctly as the vector grows.
+    #[test]
+    fn test_closure_bytes_beyond_eager_reserve() -> Result<()> {
+        // Comfortably beyond `MAX_EAGER_RESERVE`.
+        const NUM_INSTRUCTIONS: usize = 1500;
+
+        let mut closure_string = String::from("closure main:\n    input r0 as field;\n    input r1 as field;\n");
+        for i in 0..NUM_INSTRUCTIONS {
+            closure_string.push_str(&format!("    add r0 r1 into r{};\n", i + 2));
+        }
+        closure_string.push_str(&format!("    output r{} as field;", NUM_INSTRUCTIONS + 1));
+
+        let expected = Closure::<CurrentNetwork>::from_str(&closure_string)?;
+        assert_eq!(expected.instructions().len(), NUM_INSTRUCTIONS);
+
+        let expected_bytes = expected.to_bytes_le()?;
         let candidate = Closure::<CurrentNetwork>::from_bytes_le(&expected_bytes)?;
         assert_eq!(expected.to_string(), candidate.to_string());
         assert_eq!(expected_bytes, candidate.to_bytes_le()?);

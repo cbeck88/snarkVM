@@ -14,6 +14,7 @@
 // limitations under the License.
 
 use super::*;
+use crate::MAX_EAGER_RESERVE;
 
 impl<N: Network> FromBytes for ViewCore<N> {
     /// Reads the view function from a buffer.
@@ -37,7 +38,7 @@ impl<N: Network> FromBytes for ViewCore<N> {
         if num_commands > u16::try_from(N::MAX_COMMANDS).map_err(error)? {
             return Err(error(format!("Failed to deserialize view: too many commands ({num_commands})")));
         }
-        let mut commands = Vec::with_capacity(num_commands as usize);
+        let mut commands = Vec::with_capacity((num_commands as usize).min(MAX_EAGER_RESERVE));
         for _ in 0..num_commands {
             commands.push(Command::read_le(&mut reader)?);
         }

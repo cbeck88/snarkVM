@@ -14,6 +14,7 @@
 // limitations under the License.
 
 use super::*;
+use crate::MAX_EAGER_RESERVE;
 
 impl<N: Network> FromBytes for FunctionCore<N> {
     /// Reads the function from a buffer.
@@ -37,7 +38,7 @@ impl<N: Network> FromBytes for FunctionCore<N> {
         if num_instructions > u32::try_from(N::MAX_INSTRUCTIONS).map_err(error)? {
             return Err(error(format!("Failed to deserialize a function: too many instructions ({num_instructions})")));
         }
-        let mut instructions = Vec::with_capacity(num_instructions as usize);
+        let mut instructions = Vec::with_capacity((num_instructions as usize).min(MAX_EAGER_RESERVE));
         for _ in 0..num_instructions {
             instructions.push(Instruction::read_le(&mut reader)?);
         }

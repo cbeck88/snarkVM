@@ -60,6 +60,20 @@ mod parse;
 mod serialize;
 mod to_checksum;
 
+/// The most elements to reserve up front when reading a length-prefixed sequence.
+///
+/// The element counts in a serialized program are already bounded -- `MAX_INSTRUCTIONS` and
+/// `MAX_COMMANDS` are both `u16::MAX` -- but those ceilings are large in memory: 65,535
+/// `Command`s is 54 MiB and 65,535 `Instruction`s is 21 MiB, since both enums are several
+/// hundred bytes wide. Reserving a declared count up front would therefore let a couple of dozen
+/// bytes of input ask the allocator for tens of megabytes, released again as soon as the reader
+/// runs out of elements to fill it with.
+///
+/// Reserving this many instead lets the vector grow as elements are actually read. `Vec` grows
+/// geometrically, so a program that genuinely carries that many elements pays a handful of
+/// reallocations rather than one exact allocation.
+pub(crate) const MAX_EAGER_RESERVE: usize = 1024;
+
 use console::{
     network::{
         ConsensusVersion,
