@@ -27,7 +27,16 @@ const PREFIX: &str = "data";
 /// As a sanity check, we set a hardcoded upper-bound limit to the size of the data.
 /// This is to prevent a malicious node from sending us a huge data object that would
 /// cause us to run out of memory.
-const MAX_DATA_SIZE: u32 = 1024 * 1024 * 1024; // 1 GB
+///
+/// The largest `Data` a node transfers is the block list in a block response, and the transports
+/// that carry one refuse a larger frame than this well before `read_le` sees the length prefix:
+/// snarkOS caps a router frame at 128 MiB and a BFT gateway event at 256 MiB. This is the looser
+/// of the two, so it rejects nothing that could have been delivered in the first place. It is a
+/// backstop for a caller reading a `Data` from somewhere other than a capped frame, rather than
+/// the primary defence - which is the frame cap. (`read_le` below also grows its buffer as it
+/// reads instead of reserving `num_bytes` up front, so an inflated length prefix cannot on its own
+/// cause a large allocation.)
+const MAX_DATA_SIZE: u32 = 256 * 1024 * 1024; // 256 MiB
 
 /// The number of bytes a serialized `Data` adds around the object it carries: the version byte
 /// that leads it, and the `u32` length prefix on the payload that follows.
