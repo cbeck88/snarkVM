@@ -29,15 +29,14 @@ use ureq::http::{self, uri};
 
 use std::{str::FromStr, time::Duration};
 
-/// How long to wait for a connection to be established.
+/// How long to wait for a connection to be established, TLS handshake included.
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How long a response may go without delivering more of itself; resets on every read, so it
-/// bounds a peer that stops mid-answer without capping how large an answer may be.
+/// How long an answer may take to begin, and then how long its body may take; on the async path,
+/// how long it may go without delivering more of itself.
 const DEFAULT_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How long a whole request may take: the only bound that covers a peer which takes the request
-/// and never starts answering, since a response that never starts has no gaps between reads.
+/// How long a whole request may take, whatever its phases do.
 const DEFAULT_TOTAL_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Queries that use a node's REST API as their source of information.
@@ -62,6 +61,7 @@ fn agent(connect: Duration, stall: Duration, total: Duration) -> ureq::Agent {
         ureq::Agent::config_builder()
             .http_status_as_error(false)
             .timeout_connect(Some(connect))
+            .timeout_recv_response(Some(stall))
             .timeout_recv_body(Some(stall))
             .timeout_global(Some(total))
             .build(),
@@ -107,8 +107,8 @@ impl<N: Network> RestQuery<N> {
         Ok(self.client.get_or_init(|| built))
     }
 
-    /// Sets how long each request may take: `connect` to establish the connection, `stall` between
-    /// successive reads of the answer (and, on the async path only, before its first byte), `total` overall.
+    /// Sets how long each request may take: `connect` to establish the connection, `stall` for the
+    /// answer to begin and then for its body (on the async path, between successive reads), `total` overall.
     pub fn with_timeouts(mut self, connect: Duration, stall: Duration, total: Duration) -> Self {
         self.agent = agent(connect, stall, total);
         #[cfg(feature = "async")]
@@ -581,8 +581,7 @@ mod tests {
         assert_eq!(connections.load(Ordering::SeqCst), 1, "each query opened its own connection");
     }
 
-    /// A node that answers nothing has no gap between reads to measure, so only
-    /// the total bound can end the wait.
+    /// A node that answers nothing is ended by the total bound (and, at `stall`, by the header bound).
     #[test]
     fn a_node_that_never_answers_does_not_block_for_ever() {
         let (url, _) = stalling_node(b"");
@@ -594,6 +593,21 @@ mod tests {
 
         assert!(result.is_err(), "a node that answers nothing cannot produce a state root");
         assert!(waited < Duration::from_secs(5), "the request was not bounded, it waited {waited:?}");
+    }
+
+    /// The stall bound also covers the wait for the answer to begin, so a silent node does not
+    /// hold a caller for the whole total bound.
+    #[test]
+    fn a_node_that_never_answers_is_ended_by_the_stall_bound() {
+        let (url, _) = stalling_node(b"");
+        let query = bounded_query(&url, Duration::from_millis(500), Duration::from_secs(120));
+
+        let started = Instant::now();
+        let result = query.current_state_root();
+        let waited = started.elapsed();
+
+        assert!(result.is_err(), "a node that answers nothing cannot produce a state root");
+        assert!(waited < Duration::from_secs(5), "the stall bound did not cover the headers, it waited {waited:?}");
     }
 
     /// A node that begins answering and then stops is caught by the stall bound,
