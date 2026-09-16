@@ -82,25 +82,22 @@ macro_rules! impl_store_and_remote_fetch {
             use std::time::Duration;
             const CONNECT: Option<Duration> = Some(Duration::from_secs(10));
             const HEADERS: Option<Duration> = Some(Duration::from_secs(30));
-            const STALL: Option<Duration> = Some(Duration::from_secs(60));
 
-            // One agent, so the download reuses the probe's connection. `CONNECT` also bounds the DNS
-            // lookup and the request send, where ureq (3.3) completes the TLS handshake.
+            // `CONNECT` covers the DNS lookup, the TCP connect and the TLS handshake (ureq 3.4).
             let agent: ureq::Agent = ureq::Agent::config_builder()
                 .max_redirects(10)
                 .timeout_resolve(CONNECT)
                 .timeout_connect(CONNECT)
                 .timeout_send_request(CONNECT)
+                .timeout_recv_response(HEADERS)
                 .build()
                 .into();
 
-            // `timeout_recv_response` goes on the HEAD probe, not the GET, because ureq (3.3) keeps that
-            // deadline through the body read; `timeout_recv_body` resets per read, so it ends a stalled
-            // download without capping a long one.
+            // A mid-body stall is not bounded: ureq 3.4's `timeout_recv_body` is a total budget and these files
+            // reach 12.9 GB. A per-chunk bound on `Range` requests would close it.
             let fetch_once = |buffer: &mut Vec<u8>| -> Result<(), ureq::Error> {
-                agent.head(url).config().http_status_as_error(false).timeout_recv_response(HEADERS).build().call()?;
-                let mut response = agent.get(url).config().timeout_recv_body(STALL).build().call()?;
-                // Read inside the retried unit, so a mid-body stall reaches the retry arms below.
+                let mut response = agent.get(url).call()?;
+                // Read inside the retried unit, so a mid-body failure reaches the retry arms below.
                 buffer.clear();
                 response.body_mut().as_reader().read_to_end(buffer)?;
                 Ok(())
