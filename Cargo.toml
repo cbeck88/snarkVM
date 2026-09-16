@@ -564,7 +564,7 @@ version = "0.1"
 version = "0.2.5"
 
 [workspace.dependencies.ureq]
-version = "3"
+version = "3.4"
 default-features = false
 
 [workspace.dependencies.zeroize]
