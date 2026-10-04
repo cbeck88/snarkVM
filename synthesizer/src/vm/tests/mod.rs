@@ -46,5 +46,9 @@ mod test_v18;
 #[cfg(feature = "test")]
 mod test_v20;
 
+// Tests for program-owned signers (exploratory prototype).
+#[cfg(all(feature = "test", feature = "program-signer"))]
+mod test_program_signer;
+
 use super::*;
 use crate::vm::test_helpers::*;
