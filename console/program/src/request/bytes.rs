@@ -21,7 +21,7 @@ impl<N: Network> FromBytes for Request<N> {
         // Read the version.
         let version = u8::read_le(&mut reader)?;
         // Validate the version.
-        if version != 1 && version != 2 {
+        if !(1..=3).contains(&version) {
             return Err(error(format!("Invalid request version: {version}")));
         }
 
@@ -62,9 +62,14 @@ impl<N: Network> FromBytes for Request<N> {
         // Read the dynamic flag. V1 requests are implicitly static.
         let is_dynamic = match version {
             1 => false,
-            2 => bool::read_le(&mut reader)?,
-            // Note that the version is validated above to be 1 or 2.
+            2 | 3 => bool::read_le(&mut reader)?,
+            // Note that the version is validated above to be 1, 2, or 3.
             _ => unreachable!(),
+        };
+        // Read the program signer witness. Only V3 requests have one.
+        let program_signer = match version {
+            3 => Some(FromBytes::read_le(&mut reader)?),
+            _ => None,
         };
 
         Ok(Self::from((
@@ -80,16 +85,20 @@ impl<N: Network> FromBytes for Request<N> {
             tcm,
             scm,
             is_dynamic,
-        )))
+        ))
+        .with_program_signer(program_signer))
     }
 }
 
 impl<N: Network> ToBytes for Request<N> {
     /// Writes the request to a buffer.
     fn write_le<W: Write>(&self, mut writer: W) -> IoResult<()> {
-        // Always write version 2.
+        // Write version 2, or version 3 if the request has a program signer witness.
         // This is safe because `Request` is not persisted to the ledger so its serialized format can be changed.
-        2u8.write_le(&mut writer)?;
+        match self.program_signer {
+            None => 2u8.write_le(&mut writer)?,
+            Some(..) => 3u8.write_le(&mut writer)?,
+        }
         // Write the signer.
         self.signer.write_le(&mut writer)?;
         // Write the network ID.
@@ -130,6 +139,10 @@ impl<N: Network> ToBytes for Request<N> {
 
         // Write the dynamic flag.
         self.is_dynamic.write_le(&mut writer)?;
+        // Write the program signer witness, if any.
+        if let Some(program_signer) = &self.program_signer {
+            program_signer.write_le(&mut writer)?;
+        }
 
         Ok(())
     }

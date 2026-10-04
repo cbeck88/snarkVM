@@ -17,12 +17,14 @@ mod input_id;
 pub use input_id::InputID;
 
 mod bytes;
+mod program_signer;
+pub use program_signer::*;
 mod serialize;
 mod sign;
 mod string;
 mod verify;
 
-use crate::{DynamicRecord, Identifier, Plaintext, ProgramID, Record, Value, ValueType, compute_function_id};
+use crate::{DynamicRecord, Identifier, Literal, Plaintext, ProgramID, Record, Value, ValueType, compute_function_id};
 use snarkvm_console_account::{Address, ComputeKey, GraphKey, PrivateKey, Signature, ViewKey};
 use snarkvm_console_network::Network;
 use snarkvm_console_types::prelude::*;
@@ -53,6 +55,8 @@ pub struct Request<N: Network> {
     scm: Field<N>,
     /// A flag indicating whether or not the request is dynamic.
     is_dynamic: bool,
+    /// The program signer witness, if the signer is a program-owned address.
+    program_signer: Option<ProgramSignerWitness<N>>,
 }
 
 impl<N: Network>
@@ -127,6 +131,7 @@ impl<N: Network>
                 tcm,
                 scm,
                 is_dynamic,
+                program_signer: None,
             }
         }
     }
@@ -178,8 +183,23 @@ impl<N: Network> Request<N> {
         &self.tvk
     }
 
+    /// Returns the program signer witness, if the signer is a program-owned address.
+    pub const fn program_signer(&self) -> Option<&ProgramSignerWitness<N>> {
+        self.program_signer.as_ref()
+    }
+
+    /// Returns the request with the given program signer witness.
+    pub fn with_program_signer(mut self, program_signer: Option<ProgramSignerWitness<N>>) -> Self {
+        self.program_signer = program_signer;
+        self
+    }
+
     /// Returns the transition public key `tpk`.
     pub fn to_tpk(&self) -> Group<N> {
+        // For a program signer, `tpk` is `tsk * G`.
+        if let Some(program_signer) = &self.program_signer {
+            return N::g_scalar_multiply(program_signer.tsk());
+        }
         // Retrieve the challenge from the signature.
         let challenge = self.signature.challenge();
         // Retrieve the response from the signature.

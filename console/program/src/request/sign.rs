@@ -189,6 +189,126 @@ impl<N: Network> Request<N> {
             tcm,
             scm,
             is_dynamic,
+            program_signer: None,
+        })
+    }
+
+    /// Returns the request for a program-owned signer. The request carries no signature. Instead:
+    ///     tpk := tsk * G, tvk := (tsk * Y).x, for a fresh transition secret key `tsk`,
+    ///     scm := Hash(kind, Y.x, Y.y, root_tvk),
+    ///     and each record input's `gamma` is `y * H(commitment)`, with `sk_tag` derived from `y`.
+    /// The program checksum is accepted for parity with `Request::sign` and is not used.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sign_as_program<R: Rng + CryptoRng>(
+        program_signer: &ProgramSigner<N>,
+        program_id: ProgramID<N>,
+        function_name: Identifier<N>,
+        inputs: impl ExactSizeIterator<Item = impl TryInto<Value<N>>>,
+        input_types: &[ValueType<N>],
+        root_tvk: Option<Field<N>>,
+        _is_root: bool,
+        _program_checksum: Option<Field<N>>,
+        is_dynamic: bool,
+        rng: &mut R,
+    ) -> Result<Self> {
+        // Ensure the number of inputs matches the number of input types.
+        if input_types.len() != inputs.len() {
+            bail!(
+                "'{program_id}/{function_name}' expects {} inputs, but {} were provided.",
+                input_types.len(),
+                inputs.len()
+            )
+        }
+
+        // Retrieve the program-owned address `Y` and its view key `y`.
+        let signer = *program_signer.address();
+        let view_key = program_signer.view_key();
+        // Derive `sk_tag` from the graph key of `y`.
+        let sk_tag = GraphKey::try_from(view_key)?.sk_tag();
+
+        // Sample the transition secret key `tsk`.
+        let tsk = Scalar::<N>::rand(rng);
+        // Compute the transition view key `tvk` as `(tsk * Y).x`.
+        let tvk = (*signer * tsk).to_x_coordinate();
+        // Compute the transition commitment `tcm` as `Hash(tvk)`.
+        let tcm = N::hash_psd2(&[tvk])?;
+        // Compute the signer commitment `scm` as `Hash(kind, Y.x, Y.y, root_tvk)`.
+        let root_tvk = root_tvk.unwrap_or(tvk);
+        let scm = N::hash_psd2(&[
+            Field::from_u8(program_signer.kind()),
+            signer.to_x_coordinate(),
+            signer.to_y_coordinate(),
+            root_tvk,
+        ])?;
+
+        // Retrieve the network ID.
+        let network_id = U16::new(N::ID);
+        // Compute the function ID.
+        let function_id = compute_function_id(&network_id, &program_id, &function_name)?;
+
+        // Initialize a vector to store the prepared inputs.
+        let mut prepared_inputs = Vec::with_capacity(inputs.len());
+        // Initialize a vector to store the input IDs.
+        let mut input_ids = Vec::with_capacity(inputs.len());
+
+        // Prepare the inputs.
+        for (index, (input, input_type)) in inputs.zip_eq(input_types).enumerate() {
+            // Prepare the input.
+            let input = input.try_into().map_err(|_| {
+                anyhow!("Failed to parse input #{index} ('{input_type}') for '{program_id}/{function_name}'")
+            })?;
+            // If the function expects a dynamic record but a record was provided, convert it.
+            let input = match (&input, input_type) {
+                (Value::Record(record), ValueType::DynamicRecord) => {
+                    Value::DynamicRecord(DynamicRecord::from_record(record)?)
+                }
+                _ => input,
+            };
+            // Store the prepared input.
+            prepared_inputs.push(input.clone());
+
+            // Convert index to u16.
+            let index = u16::try_from(index).map_err(|_| anyhow!("Input index exceeds u16"))?;
+
+            let input_id = match input_type {
+                ValueType::Constant(..) => InputID::constant(function_id, &input, tcm, index)?,
+                ValueType::Public(..) => InputID::public(function_id, &input, tcm, index)?,
+                ValueType::Private(..) => InputID::private(function_id, &input, tvk, index)?,
+                // A record input's `gamma` is `y * H`, so `y` takes the place of `sk_sig`.
+                ValueType::Record(record_name) => {
+                    InputID::record(&program_id, record_name, &input, &signer, &view_key, &*view_key, sk_tag)?
+                }
+                ValueType::ExternalRecord(..) => InputID::external_record(function_id, &input, tvk, index)?,
+                ValueType::Future(..) => bail!("A future is not a valid input"),
+                ValueType::DynamicRecord => InputID::dynamic_record(function_id, &input, tvk, index)?,
+                ValueType::DynamicFuture => bail!("A dynamic future is not a valid input"),
+            };
+            input_ids.push(input_id);
+        }
+
+        // Use an unused signature, so that the request has the same shape as a signed request.
+        let compute_key = ComputeKey::try_from(PrivateKey::<N>::new(rng)?)?;
+        let signature = Signature::from((Scalar::zero(), Scalar::zero(), compute_key));
+
+        Ok(Self {
+            signer,
+            network_id,
+            program_id,
+            function_name,
+            input_ids,
+            inputs: prepared_inputs,
+            signature,
+            sk_tag,
+            tvk,
+            tcm,
+            scm,
+            is_dynamic,
+            program_signer: Some(ProgramSignerWitness::new(
+                program_signer.kind(),
+                *program_signer.internal(),
+                *view_key,
+                tsk,
+            )),
         })
     }
 
@@ -287,6 +407,7 @@ impl<N: Network> Request<N> {
             tcm: Field::rand(rng),
             scm: Field::rand(rng),
             is_dynamic,
+            program_signer: None,
         })
     }
 }

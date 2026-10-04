@@ -126,16 +126,24 @@ impl<N: Network> Request<N> {
 
                         // Compute the generator `H` as `HashToGroup(commitment)`.
                         let h = N::hash_to_group_psd2(&[N::serial_number_domain(), *commitment])?;
-                        // Compute `h_r` as `(challenge * gamma) + (response * H)`, equivalent to `r * H`.
-                        let h_r = (*gamma * challenge) + (h * response);
 
                         // Compute the tag as `Hash(sk_tag || commitment)`.
                         let candidate_tag = N::hash_psd2(&[self.sk_tag, *commitment])?;
                         ensure!(*tag == candidate_tag, "Expected a record input with the same tag");
 
-                        // Add (`H`, `r * H`, `gamma`, `tag`) to the message.
-                        message.extend([h, h_r, *gamma].iter().map(|point| point.to_x_coordinate()));
-                        message.push(*tag);
+                        match &self.program_signer {
+                            None => {
+                                // Compute `h_r` as `(challenge * gamma) + (response * H)`, equivalent to `r * H`.
+                                let h_r = (*gamma * challenge) + (h * response);
+                                // Add (`H`, `r * H`, `gamma`, `tag`) to the message.
+                                message.extend([h, h_r, *gamma].iter().map(|point| point.to_x_coordinate()));
+                                message.push(*tag);
+                            }
+                            // For a program signer, `gamma` must be `y * H`.
+                            Some(program_signer) => {
+                                ensure!(*gamma == h * *program_signer.view_key(), "Expected gamma to be y * H");
+                            }
+                        }
                     }
                     // An external record input is hashed (using `tvk`) to a field element.
                     InputID::ExternalRecord(input_hash) => {
@@ -157,8 +165,54 @@ impl<N: Network> Request<N> {
             return false;
         }
 
-        // Verify the signature.
-        self.signature.verify(&self.signer, &message)
+        match &self.program_signer {
+            // Verify the signature.
+            None => self.signature.verify(&self.signer, &message),
+            // Verify the program signer.
+            Some(program_signer) => match self.verify_program_signer(program_signer, input_types, is_root.is_one()) {
+                Ok(()) => true,
+                Err(error) => {
+                    eprintln!("Request verification failed on program signer checks: {error}");
+                    false
+                }
+            },
+        }
+    }
+
+    /// Checks the program signer witness, in place of the signature:
+    ///  - `tvk == (tsk * Y).x`;
+    ///  - if the request has record inputs, `Y == y * G` and `sk_tag == Hash(graph_dom, y, 0)`;
+    ///  - at the root, the program has opted in and `Y == X + Ht(kind, P, X) * G`, with `P` the request's program.
+    fn verify_program_signer(
+        &self,
+        program_signer: &ProgramSignerWitness<N>,
+        input_types: &[ValueType<N>],
+        is_root: bool,
+    ) -> Result<()> {
+        ensure!(program_signer.kind() == PROGRAM_SIGNER_KIND_SIGNER, "Unsupported program signer kind");
+        // Ensure `tvk == (tsk * Y).x`.
+        ensure!(self.tvk == (*self.signer * *program_signer.tsk()).to_x_coordinate(), "Expected tvk to be (tsk * Y).x");
+        // If there are record inputs, ensure `y` is the view key of `Y` and `sk_tag` derives from it.
+        if input_types.iter().any(|input_type| matches!(input_type, ValueType::Record(..))) {
+            ensure!(*self.signer == N::g_scalar_multiply(program_signer.view_key()), "Expected Y to be y * G");
+            let sk_tag = GraphKey::try_from(ViewKey::from_scalar(*program_signer.view_key()))?.sk_tag();
+            ensure!(self.sk_tag == sk_tag, "Expected sk_tag to derive from y");
+        }
+        // At the root, ensure the program has opted in and owns `Y`.
+        if is_root {
+            ensure!(
+                program_signer_opt_in(&self.program_id),
+                "Program '{}' has not opted in to program signers",
+                self.program_id
+            );
+            let expected = program_signer_address(
+                program_signer.kind(),
+                &self.program_id.to_address()?,
+                program_signer.internal(),
+            )?;
+            ensure!(expected == self.signer, "The signer is not owned by program '{}'", self.program_id);
+        }
+        Ok(())
     }
 }
 

@@ -22,6 +22,10 @@ impl<N: Network> Serialize for Request<N> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match serializer.is_human_readable() {
             true => {
+                // TODO(prototype): the JSON format does not carry the program signer witness.
+                if self.program_signer.is_some() {
+                    return Err(ser::Error::custom("JSON serialization of program-signer requests is not supported"));
+                }
                 let mut request = serializer.serialize_struct("Request", 12)?;
                 request.serialize_field("signer", &self.signer)?;
                 request.serialize_field("network", &self.network_id)?;
