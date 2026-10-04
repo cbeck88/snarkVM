@@ -260,16 +260,16 @@ impl<'a, N: Network> ProcessExclusiveGuard<'a, N> {
 
     /// Update the `credits.aleo` program in the VM with the latest verifying keys.
     pub fn update_credits_verifying_keys(&self) -> Result<()> {
-        // With program signers, `Process::load` already re-keyed 'credits.aleo'; the stored keys are stale.
-        if cfg!(feature = "program-signer") {
-            return Ok(());
-        }
-
         // Initialize the store for 'credits.aleo'.
         let credits = Program::<N>::credits()?;
 
         // Synthesize the 'credits.aleo' verifying keys.
-        for function_name in credits.functions().keys() {
+        // With program signers, `Process::load` already re-keyed the 'credits.aleo' functions; the stored keys are stale.
+        let function_names = match cfg!(feature = "program-signer") {
+            true => vec![],
+            false => credits.functions().keys().collect(),
+        };
+        for function_name in function_names {
             // Remove the proving key.
             self.process.remove_proving_key(credits.id(), function_name)?;
             // Load the verifying key.

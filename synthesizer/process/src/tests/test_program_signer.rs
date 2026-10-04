@@ -125,9 +125,18 @@ fn measure_function(
     let stack = process.get_stack(program_id).unwrap();
     let input_types = stack.get_function(&function_name).unwrap().input_types();
     let address = signer.address().unwrap();
+    // In `CheckDeployment` mode, child requests are signed by the burner key, so external records belong to it.
+    let burner = PrivateKey::<CurrentNetwork>::new(rng).unwrap();
+    let burner_address = console::account::Address::try_from(&burner).unwrap();
     let inputs = input_types
         .iter()
-        .map(|input_type| stack.sample_value(&address, &input_type.into(), rng))
+        .map(|input_type| match input_type {
+            console::program::ValueType::ExternalRecord(locator) => process
+                .get_stack(locator.program_id())
+                .unwrap()
+                .sample_value(&burner_address, &console::program::ValueType::Record(*locator.resource()).into(), rng),
+            _ => stack.sample_value(&address, &input_type.into(), rng),
+        })
         .collect::<Result<Vec<_>>>()
         .unwrap();
     let caller = caller.map(|caller| ProgramID::<CurrentNetwork>::from_str(caller).unwrap());
@@ -136,10 +145,10 @@ fn measure_function(
         .sign(program_id, function_name, inputs.into_iter(), &input_types, root_tvk, caller.is_none(), None, false, rng)
         .unwrap();
     let assignments = std::sync::Arc::new(parking_lot::RwLock::new(Vec::new()));
-    let burner = PrivateKey::<CurrentNetwork>::new(rng).unwrap();
     let call_stack = CallStack::CheckDeployment(vec![request], burner, assignments.clone(), None, None, None);
     stack.execute_function::<CurrentAleo, _>(call_stack, caller, root_tvk, rng).unwrap();
     let assignments = assignments.read();
+    // The root's assignment is pushed last, after its children's.
     let (assignment, _) = assignments.last().unwrap();
     (assignment.num_public(), assignment.num_private(), assignment.num_constraints(), assignment.num_nonzeros())
 }
@@ -173,6 +182,85 @@ fn test_program_signer_measure_credits() {
                 "MEASURE feature={feature} credits.aleo/{function_name} program  child (public, private, constraints, nonzeros) = {program:?}"
             );
             assert_eq!(child, program);
+        }
+    }
+}
+
+/// Prints the circuit size of an opted-in vault function (which pays for the root tweak check), with ordinary and
+/// program signers at the root. Run with and without the `program-signer` feature to compare.
+#[test]
+fn test_program_signer_measure_vault() {
+    let rng = &mut TestRng::default();
+    let program = Program::<CurrentNetwork>::from_str(
+        r"
+import credits.aleo;
+
+program vault_measure.aleo;
+
+struct approval:
+    vault as address;
+    nonce as u64;
+    recipient as address;
+    amount as u64;
+
+record config:
+    owner as address.private;
+    signer0 as address.private;
+    signer1 as address.private;
+    signer2 as address.private;
+    threshold as u8.private;
+    nonce as u64.private;
+
+function execute_transfer:
+    input r0 as config.record;
+    input r1 as credits.aleo/credits.record;
+    input r2 as address.private;
+    input r3 as u64.private;
+    input r4 as signature.private;
+    input r5 as signature.private;
+    input r6 as signature.private;
+    assert.eq self.caller self.signer;
+    cast self.signer r0.nonce r2 r3 into r7 as approval;
+    sign.verify r4 r0.signer0 r7 into r8;
+    sign.verify r5 r0.signer1 r7 into r9;
+    sign.verify r6 r0.signer2 r7 into r10;
+    ternary r8 1u8 0u8 into r11;
+    ternary r9 1u8 0u8 into r12;
+    ternary r10 1u8 0u8 into r13;
+    add r11 r12 into r14;
+    add r14 r13 into r15;
+    gte r15 r0.threshold into r16;
+    assert.eq r16 true;
+    call credits.aleo/transfer_private r1 r2 r3 into r17 r18;
+    add r0.nonce 1u64 into r19;
+    cast r0.owner r0.signer0 r0.signer1 r0.signer2 r0.threshold r19 into r20 as config.record;
+    output r20 as config.record;
+    output r17 as credits.aleo/credits.record;
+    output r18 as credits.aleo/credits.record;
+
+function noop:
+    input r0 as u64.private;
+    output r0 as u64.private;
+",
+    )
+    .unwrap();
+    let process = crate::test_helpers::sample_process(&program);
+    let account = console::program::RequestSigner::Account(PrivateKey::new(rng).unwrap());
+    let program_signer = console::program::RequestSigner::Program(
+        ProgramSigner::from_internal_secret(*program.id(), Scalar::rand(rng)).unwrap(),
+    );
+    let feature = if cfg!(feature = "program-signer") { "on" } else { "off" };
+    for function_name in ["execute_transfer", "noop"] {
+        let root = measure_function(&process, "vault_measure.aleo", function_name, &account, None, rng);
+        println!(
+            "MEASURE feature={feature} vault_measure.aleo/{function_name} ordinary root (public, private, constraints, nonzeros) = {root:?}"
+        );
+        if cfg!(feature = "program-signer") {
+            let program = measure_function(&process, "vault_measure.aleo", function_name, &program_signer, None, rng);
+            println!(
+                "MEASURE feature={feature} vault_measure.aleo/{function_name} program  root (public, private, constraints, nonzeros) = {program:?}"
+            );
+            assert_eq!(root, program);
         }
     }
 }
