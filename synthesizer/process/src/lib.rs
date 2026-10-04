@@ -60,6 +60,7 @@ use console::{
         ProgramID,
         Record,
         Request,
+        RequestSigner,
         Response,
         Value,
         ValueType,
@@ -259,6 +260,11 @@ impl<'a, N: Network> ProcessExclusiveGuard<'a, N> {
 
     /// Update the `credits.aleo` program in the VM with the latest verifying keys.
     pub fn update_credits_verifying_keys(&self) -> Result<()> {
+        // With program signers, `Process::load` already re-keyed 'credits.aleo'; the stored keys are stale.
+        if cfg!(feature = "program-signer") {
+            return Ok(());
+        }
+
         // Initialize the store for 'credits.aleo'.
         let credits = Program::<N>::credits()?;
 
@@ -419,6 +425,10 @@ impl<N: Network> Process<N> {
         let num_variables = verifying_key.circuit_info.num_public_and_private_variables as u64;
         stack.insert_verifying_key(&record_name, VerifyingKey::new(verifying_key.clone(), num_variables))?;
         lap!(timer, "Load circuit keys");
+
+        // With program signers, every request circuit changes, so the stored 'credits.aleo' function keys are stale.
+        #[cfg(feature = "program-signer")]
+        program_signer_rekey::rekey_credits(&stack)?;
 
         // Add the stack to the process.
         process.lock().add_stack(stack);
@@ -832,5 +842,72 @@ function compute:
         process.lock().add_program(program).unwrap();
         // Return the process.
         process
+    }
+}
+
+/// Re-keying of 'credits.aleo' for request circuits with program signers (exploratory prototype).
+///
+/// TODO(prototype): this models the network re-keying every program at activation. It synthesizes the
+/// 'credits.aleo' function keys locally, once per process, instead of loading the stored parameters.
+#[cfg(feature = "program-signer")]
+mod program_signer_rekey {
+    use super::*;
+    use std::{
+        any::Any,
+        collections::HashMap,
+        sync::{Mutex, OnceLock},
+    };
+
+    type CreditsKeys<N> = Vec<(Identifier<N>, ProvingKey<N>, VerifyingKey<N>)>;
+
+    /// Synthesizes the keys of every function of the given stack.
+    fn synthesize_all<N: Network, A: circuit::Aleo<Network = N>>(stack: &Stack<N>) -> Result<()> {
+        let rng = &mut rand::rng();
+        for function_name in stack.program().functions().keys() {
+            stack.synthesize_key::<A, _>(function_name, rng)?;
+        }
+        Ok(())
+    }
+
+    /// Downcasts the stack to the given network.
+    fn downcast<N: Network, N2: Network>(stack: &Stack<N>) -> Result<&Stack<N2>> {
+        (stack as &dyn Any).downcast_ref::<Stack<N2>>().ok_or_else(|| anyhow!("Failed to downcast the stack"))
+    }
+
+    /// Replaces the 'credits.aleo' function keys with keys synthesized for the current request circuit.
+    pub(super) fn rekey_credits<N: Network>(stack: &Stack<N>) -> Result<()> {
+        static CACHE: OnceLock<Mutex<HashMap<u16, Box<dyn Any + Send + Sync>>>> = OnceLock::new();
+        let mut cache = CACHE.get_or_init(Default::default).lock().map_err(|_| anyhow!("Poisoned key cache"))?;
+
+        if let Some(keys) = cache.get(&N::ID).and_then(|keys| keys.downcast_ref::<CreditsKeys<N>>()) {
+            for (function_name, proving_key, verifying_key) in keys {
+                stack.insert_proving_key(function_name, proving_key.clone())?;
+                stack.insert_verifying_key(function_name, verifying_key.clone())?;
+            }
+            return Ok(());
+        }
+
+        // Remove the stored keys, so that `synthesize_key` does not skip any function.
+        for function_name in stack.program().functions().keys() {
+            stack.remove_proving_key(function_name);
+            stack.remove_verifying_key(function_name);
+        }
+        match N::ID {
+            console::network::MainnetV0::ID => synthesize_all::<_, circuit::AleoV0>(downcast(stack)?)?,
+            console::network::TestnetV0::ID => synthesize_all::<_, circuit::AleoTestnetV0>(downcast(stack)?)?,
+            console::network::CanaryV0::ID => synthesize_all::<_, circuit::AleoCanaryV0>(downcast(stack)?)?,
+            _ => bail!("Unsupported network ID"),
+        }
+
+        let keys: CreditsKeys<N> = stack
+            .program()
+            .functions()
+            .keys()
+            .map(|function_name| {
+                Ok((*function_name, stack.get_proving_key(function_name)?, stack.get_verifying_key(function_name)?))
+            })
+            .collect::<Result<_>>()?;
+        cache.insert(N::ID, Box::new(keys));
+        Ok(())
     }
 }

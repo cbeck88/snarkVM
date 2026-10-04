@@ -36,6 +36,19 @@ impl<N: Network> Stack<N> {
         inputs: impl ExactSizeIterator<Item = impl TryInto<Value<N>>>,
         rng: &mut R,
     ) -> Result<Authorization<N>, StackAuthError> {
+        self.authorize_with_signer::<A, R>(&RequestSigner::Account(*private_key), function_name, inputs, rng)
+    }
+
+    /// Authorizes a call to the program function for the given inputs, with the given signer.
+    /// Every request in the call tree is signed by `signer`.
+    #[inline]
+    pub fn authorize_with_signer<A: circuit::Aleo<Network = N>, R: Rng + CryptoRng>(
+        &self,
+        signer: &RequestSigner<N>,
+        function_name: impl TryInto<Identifier<N>>,
+        inputs: impl ExactSizeIterator<Item = impl TryInto<Value<N>>>,
+        rng: &mut R,
+    ) -> Result<Authorization<N>, StackAuthError> {
         let timer = timer!("Stack::authorize");
 
         // Get the program ID.
@@ -58,8 +71,7 @@ impl<N: Network> Stack<N> {
         // This is the root request and we do not have a root_tvk to pass on.
         let root_tvk = None;
         // Compute the request.
-        let request = Request::sign(
-            private_key,
+        let request = signer.sign(
             program_id,
             function_name,
             inputs,
@@ -74,7 +86,7 @@ impl<N: Network> Stack<N> {
         // Initialize the authorization.
         let authorization = Authorization::new(request.clone());
         // Construct the call stack.
-        let call_stack = CallStack::Authorize(vec![request], Some(*private_key), authorization.clone());
+        let call_stack = CallStack::Authorize(vec![request], Some(*signer), authorization.clone());
         // Construct the authorization from the function.
         let _response = self.execute_function::<A, R>(call_stack, caller, root_tvk, rng)?;
         finish!(timer, "Construct the authorization from the function");
@@ -131,7 +143,8 @@ impl<N: Network> Stack<N> {
         // Initialize the authorization.
         let authorization = Authorization::new(request.clone());
         // Construct the call stack.
-        let call_stack = CallStack::Authorize(vec![request], Some(*private_key), authorization.clone());
+        let call_stack =
+            CallStack::Authorize(vec![request], Some(RequestSigner::Account(*private_key)), authorization.clone());
         // Construct the authorization from the function.
         let _response = self.evaluate_function::<A, R>(call_stack, caller, root_tvk, rng)?;
         finish!(timer, "Construct the authorization from the function");

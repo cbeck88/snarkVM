@@ -36,6 +36,23 @@ impl<N: Network> Process<N> {
             .map_err(ProcessAuthError::from)
     }
 
+    /// Authorizes a call to the program function for the given inputs, with the given signer
+    /// (an account, or a program-owned address).
+    #[inline]
+    pub fn authorize_with_signer<A: circuit::Aleo<Network = N>, R: Rng + CryptoRng>(
+        &self,
+        signer: &RequestSigner<N>,
+        program_id: impl TryInto<ProgramID<N>>,
+        function_name: impl TryInto<Identifier<N>>,
+        inputs: impl ExactSizeIterator<Item = impl TryInto<Value<N>>>,
+        rng: &mut R,
+    ) -> Result<Authorization<N>, ProcessAuthError> {
+        // Authorize the call.
+        self.get_stack(program_id)?
+            .authorize_with_signer::<A, R>(signer, function_name, inputs, rng)
+            .map_err(ProcessAuthError::from)
+    }
+
     /// Authorizes a call to the program function for the given inputs.
     /// Compared to `authorize`, this method does not check for circuit satisfiability of the request.
     #[inline]

@@ -97,8 +97,7 @@ impl<N: Network> CallTrait<N> for Call<N> {
                     false => None,
                 };
                 // Compute the request.
-                let request = Request::sign(
-                    private_key,
+                let request = private_key.sign(
                     *substack.program_id(),
                     *function.name(),
                     inputs.iter(),
@@ -312,8 +311,7 @@ impl<N: Network> CallTrait<N> for Call<N> {
                             return Err(anyhow!("Cannot authorize a new function call without a private key.").into());
                         };
                         // Compute the request.
-                        let request = Request::sign(
-                            private_key,
+                        let request = private_key.sign(
                             *substack.program_id(),
                             *function.name(),
                             inputs.iter(),

@@ -153,3 +153,45 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
         result
     }
 }
+
+impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
+    /// Authorizes a call to the program function for the given inputs, with the given signer
+    /// (an account, or a program-owned address). Every request in the call tree is signed by `signer`.
+    #[inline]
+    pub fn authorize_with_signer<R: Rng + CryptoRng>(
+        &self,
+        signer: &console::program::RequestSigner<N>,
+        program_id: impl TryInto<ProgramID<N>>,
+        function_name: impl TryInto<Identifier<N>>,
+        inputs: impl IntoIterator<IntoIter = impl ExactSizeIterator<Item = impl TryInto<Value<N>>>>,
+        rng: &mut R,
+    ) -> Result<Authorization<N>> {
+        use console::program::RequestSigner;
+
+        let program_id = program_id.try_into().map_err(|_| anyhow!("Invalid program ID"))?;
+        let function_name = function_name.try_into().map_err(|_| anyhow!("Invalid function name"))?;
+        let inputs = inputs
+            .into_iter()
+            .enumerate()
+            .map(|(index, input)| {
+                input
+                    .try_into()
+                    .map_err(|_| anyhow!("Failed to parse input #{index} for '{program_id}/{function_name}'"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        macro_rules! logic {
+            ($process:expr, $network:path, $aleo:path) => {{
+                let authorization = $process.authorize_with_signer::<$aleo, _>(
+                    cast_ref!(&signer as RequestSigner<$network>),
+                    cast_ref!(program_id as ProgramID<$network>),
+                    cast_ref!(function_name as Identifier<$network>),
+                    cast_ref!(inputs as Vec<Value<$network>>).iter(),
+                    rng,
+                )?;
+                Ok(cast_ref!(authorization as Authorization<N>).clone())
+            }};
+        }
+        process!(self, logic)
+    }
+}

@@ -117,8 +117,7 @@ impl<N: Network> CallTrait<N> for CallDynamic<N> {
                 let callee_inputs = convert_caller_inputs_to_callee_inputs(inputs, &input_types, substack)?;
 
                 // Compute the request.
-                let request = Request::sign(
-                    private_key,
+                let request = private_key.sign(
                     *substack.program_id(),
                     *function.name(),
                     callee_inputs.iter(),
@@ -356,8 +355,7 @@ impl<N: Network> CallTrait<N> for CallDynamic<N> {
                             convert_caller_inputs_to_callee_inputs(&inputs, input_types, target.substack())?;
 
                         // Construct the callee's version of the request.
-                        let callee_request = Request::sign(
-                            private_key,
+                        let callee_request = private_key.sign(
                             *target.substack().program_id(),
                             *function.name(),
                             callee_inputs.iter(),

@@ -60,6 +60,7 @@ use console::{
         RecordType,
         RegisterType,
         Request,
+        RequestSigner,
         Response,
         ToFields,
         U8,
@@ -125,7 +126,8 @@ pub type InputRecordLikeTracker<N> = HashMap<Field<N>, Vec<(usize, usize)>>;
 #[derive(Clone, Debug)]
 pub enum CallStack<N: Network> {
     /// Authorize an `Execute` transaction.
-    Authorize(Vec<Request<N>>, Option<PrivateKey<N>>, Authorization<N>),
+    /// The signer is an account or a program-owned address, and signs every request in the call tree.
+    Authorize(Vec<Request<N>>, Option<RequestSigner<N>>, Authorization<N>),
     /// Mock an evaluation.
     AuthorizeMocked(
         Vec<Request<N>>,
@@ -505,6 +507,10 @@ impl<N: Network> Stack<N> {
 
     /// Inserts the proving key if the program ID is 'credits.aleo'.
     fn try_insert_credits_function_proving_key(&self, function_name: &Identifier<N>) -> Result<()> {
+        // With program signers, the stored 'credits.aleo' proving keys are stale (see `Process::load`).
+        if cfg!(feature = "program-signer") {
+            return Ok(());
+        }
         // If the program is 'credits.aleo' and it does not exist yet, load the proving key directly.
         if self.program_id() == &ProgramID::from_str("credits.aleo")?
             && !self.proving_keys.read().contains_key(function_name)

@@ -117,7 +117,6 @@ fn measure_function(
     caller: Option<&str>,
     rng: &mut TestRng,
 ) -> (u64, u64, u64, (u64, u64, u64)) {
-    use crate::Authorization;
     use console::program::{ProgramID, Request};
     use snarkvm_synthesizer_program::StackTrait;
 
