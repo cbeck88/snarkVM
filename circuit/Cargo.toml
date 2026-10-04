@@ -27,6 +27,7 @@ edition = "2024"
 save_r1cs_hashes = [ "snarkvm-circuit-environment/save_r1cs_hashes" ]
 dev-print = ["snarkvm-circuit-environment/dev-print"]
 test = [ "snarkvm-circuit-environment/test" ]
+program-signer = [ "snarkvm-circuit-program/program-signer" ]
 
 [dependencies.snarkvm-circuit-account]
 workspace = true

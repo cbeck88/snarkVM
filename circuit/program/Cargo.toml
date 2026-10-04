@@ -48,3 +48,4 @@ workspace = true
 
 [features]
 dev-print = [ "snarkvm-utilities/dev-print" ]
+program-signer = [ ]

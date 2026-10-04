@@ -49,6 +49,7 @@ serial = [
 ]
 setup = [ ]
 test = [ "snarkvm-console/test", "snarkvm-ledger-store/test", "snarkvm-synthesizer-process/test" ]
+program-signer = [ "snarkvm-synthesizer-process/program-signer" ]
 test-old-consensus-versions = [ "test" ]
 timer = [ "aleo-std/timer" ]
 wasm = [
