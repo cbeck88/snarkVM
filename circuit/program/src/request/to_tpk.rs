@@ -17,6 +17,7 @@ use super::*;
 
 impl<A: Aleo> Request<A> {
     /// Returns the transition public key `tpk`.
+    /// Note: For a program signer, the circuit enforces `tpk == tsk * G` instead (see `Request::verify`).
     pub fn to_tpk(&self) -> Group<A> {
         // Retrieve the challenge from the signature.
         let challenge = self.signature.challenge();

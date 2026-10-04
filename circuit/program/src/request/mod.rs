@@ -13,13 +13,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod program_signer;
 mod to_tpk;
 mod verify;
 
-use crate::{Identifier, Plaintext, ProgramID, Record, Value, compute_function_id};
+pub use program_signer::ProgramSignerWitness;
+
+use crate::{Identifier, Literal, Plaintext, ProgramID, Record, Value, compute_function_id};
 use snarkvm_circuit_account::Signature;
 use snarkvm_circuit_network::Aleo;
-use snarkvm_circuit_types::{Address, Boolean, Field, Group, U16, environment::prelude::*};
+use snarkvm_circuit_types::{Address, Boolean, Field, Group, Scalar, U16, environment::prelude::*};
+
+/// Whether request circuits support program signers. When disabled, request circuits are unchanged.
+pub const PROGRAM_SIGNER_CIRCUIT: bool = cfg!(feature = "program-signer");
 
 pub enum InputID<A: Aleo> {
     /// The hash of the constant input.
@@ -154,6 +160,8 @@ pub struct Request<A: Aleo> {
     scm: Field<A>,
     /// A flag indicating whether or not the request is dynamic.
     is_dynamic: bool,
+    /// The program signer witness, present if and only if `PROGRAM_SIGNER_CIRCUIT` is enabled.
+    program_signer: Option<ProgramSignerWitness<A>>,
 }
 
 impl<A: Aleo> Inject for Request<A> {
@@ -249,6 +257,15 @@ impl<A: Aleo> Inject for Request<A> {
             tcm,
             scm,
             is_dynamic: request.is_dynamic(),
+            program_signer: match PROGRAM_SIGNER_CIRCUIT {
+                true => Some(ProgramSignerWitness::new(mode, request.program_signer())),
+                false => {
+                    if request.program_signer().is_some() {
+                        A::halt("Program signers require the 'program-signer' feature")
+                    }
+                    None
+                }
+            },
         }
     }
 }
@@ -320,7 +337,7 @@ impl<A: Aleo> Eject for Request<A> {
 
     /// Ejects the mode of the request.
     fn eject_mode(&self) -> Mode {
-        Mode::combine(self.signer.eject_mode(), [
+        let mode = Mode::combine(self.signer.eject_mode(), [
             self.network_id.eject_mode(),
             self.program_id.eject_mode(),
             self.function_name.eject_mode(),
@@ -331,7 +348,11 @@ impl<A: Aleo> Eject for Request<A> {
             self.tvk.eject_mode(),
             self.tcm.eject_mode(),
             self.scm.eject_mode(),
-        ])
+        ]);
+        match &self.program_signer {
+            Some(program_signer) => Mode::combine(mode, [program_signer.eject_mode()]),
+            None => mode,
+        }
     }
 
     /// Ejects the request as a primitive.
@@ -350,5 +371,6 @@ impl<A: Aleo> Eject for Request<A> {
             self.scm.eject_value(),
             self.is_dynamic,
         ))
+        .with_program_signer(self.program_signer.as_ref().and_then(|program_signer| program_signer.eject_value()))
     }
 }

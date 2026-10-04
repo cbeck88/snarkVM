@@ -317,7 +317,9 @@ impl<N: Network> Stack<N> {
         let caller = Ternary::ternary(&is_root, request.signer(), &parent);
 
         // Ensure the request has a valid signature, inputs, and transition view key.
-        A::assert(request.verify(&input_types, &tpk, Some(root_tvk), is_root, program_checksum))?;
+        // Determine whether the program may root executions with a program signer.
+        let is_opted_in = console::program::program_signer_opt_in(console_request.program_id());
+        A::assert(request.verify(&input_types, &tpk, Some(root_tvk), is_root, program_checksum, &parent, is_opted_in))?;
         lap!(timer, "Verify the circuit request");
 
         // Set the transition signer.

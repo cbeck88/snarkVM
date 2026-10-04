@@ -765,6 +765,7 @@ impl<N: Network> CallTrait<N> for CallDynamic<N> {
                 &tcm,
                 None,
                 Some(function_id.clone()),
+                None,
             );
             A::assert(check_input_ids)?;
             lap!(timer, "Checked the input ids");

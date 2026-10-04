@@ -22,6 +22,15 @@ impl<A: Aleo> Request<A> {
     /// Verifies (challenge == challenge') && (address == address') && (serial_numbers == serial_numbers') where:
     ///     challenge' := HashToScalar(r * G, pk_sig, pr_sig, signer, \[tvk, tcm, function ID, is_root, program checksum?, input IDs\])
     /// The program checksum must be provided if the program has a constructor and should not be provided otherwise.
+    ///
+    /// If `PROGRAM_SIGNER_CIRCUIT` is enabled, the request may instead have a program-owned signer `Y`,
+    /// and a ternary on the signer kind replaces the signature checks with:
+    ///     tpk == tsk * G, tvk == (tsk * Y).x, scm == Hash(kind, Y.x, Y.y, root_tvk),
+    ///     gamma == y * H(commitment) for each record input,
+    ///     Y == y * G and sk_tag == Hash(graph_dom, y, 0) if the function has record inputs,
+    ///     and at the root, Y == X + Ht(kind, parent, X) * G, if the program has opted in (`is_opted_in`).
+    /// The circuit has the same shape for both kinds.
+    #[allow(clippy::too_many_arguments)]
     pub fn verify(
         &self,
         input_types: &[console::ValueType<A::Network>],
@@ -29,12 +38,24 @@ impl<A: Aleo> Request<A> {
         root_tvk: Option<Field<A>>,
         is_root: Boolean<A>,
         program_checksum: Option<Field<A>>,
+        parent: &Address<A>,
+        is_opted_in: bool,
     ) -> Boolean<A> {
         // Compute the function ID.
         let function_id = compute_function_id(&self.network_id, &self.program_id, &self.function_name);
 
+        // Retain 'is_root' as a boolean.
+        let is_root_boolean = is_root.clone();
         // Compute 'is_root' as a field element.
         let is_root = Ternary::ternary(&is_root, &Field::<A>::one(), &Field::<A>::zero());
+
+        // For a program signer, `y` takes the place of the signature response in `response * H`.
+        let record_scalar = self.program_signer.as_ref().map(|program_signer| {
+            (
+                program_signer.is_program.clone(),
+                Scalar::ternary(&program_signer.is_program, &program_signer.view_key, self.signature.response()),
+            )
+        });
 
         // Construct the signature message as `[tvk, tcm, function ID, is_root, program checksum?, input IDs]`.
         let mut message = Vec::with_capacity(3 + 4 * self.input_ids.len());
@@ -61,6 +82,7 @@ impl<A: Aleo> Request<A> {
             &self.tcm,
             Some(&self.signature),
             None, // The function ID is intentionally not passed here to ensure that the existing circuit does not change.
+            record_scalar.as_ref().map(|(is_program, scalar)| (is_program, scalar)),
         );
         // Append the input elements to the message.
         match append_to_message {
@@ -70,6 +92,21 @@ impl<A: Aleo> Request<A> {
 
         // Determine the root transition view key.
         let root_tvk = root_tvk.unwrap_or(Field::<A>::new(Mode::Private, self.tvk.eject_value()));
+
+        // If the circuit supports program signers, verify the request with the kind ternary.
+        if let Some(program_signer) = &self.program_signer {
+            return self.verify_with_program_signer(
+                program_signer,
+                input_types,
+                tpk,
+                root_tvk,
+                &is_root_boolean,
+                &message,
+                input_checks,
+                parent,
+                is_opted_in,
+            );
+        }
 
         // Verify the transition public key and commitments are well-formed.
         let tpk_checks = {
@@ -113,6 +150,104 @@ impl<A: Aleo> Request<A> {
         signature_checks & input_checks & tpk_checks
     }
 
+    /// Verifies the request in a circuit that supports both ordinary and program signers.
+    #[allow(clippy::too_many_arguments)]
+    fn verify_with_program_signer(
+        &self,
+        program_signer: &ProgramSignerWitness<A>,
+        input_types: &[console::ValueType<A::Network>],
+        tpk: &Group<A>,
+        root_tvk: Field<A>,
+        is_root: &Boolean<A>,
+        message: &[Field<A>],
+        input_checks: Boolean<A>,
+        parent: &Address<A>,
+        is_opted_in: bool,
+    ) -> Boolean<A> {
+        let is_program = &program_signer.is_program;
+        let signer = self.signer.to_group();
+        let pk_sig = self.signature.compute_key().pk_sig();
+
+        // Compute `P = c * B`, which is `challenge * pk_sig` for an ordinary signer and `tsk * Y` for a program signer.
+        let c = Scalar::ternary(is_program, &program_signer.tsk, self.signature.challenge());
+        let b = Group::ternary(is_program, &signer, pk_sig);
+        let p = &b * &c;
+        // Compute `Q = s * G`, which is `response * G` for an ordinary signer and `tsk * G` for a program signer.
+        let s = Scalar::ternary(is_program, &program_signer.tsk, self.signature.response());
+        let q = A::g_scalar_multiply(&s);
+        // The candidate `tpk` is `challenge * pk_sig + response * G` for an ordinary signer, and `tsk * G` for a program signer.
+        let candidate_tpk = Group::ternary(is_program, &q, &(&p + &q));
+
+        // Checks common to both kinds.
+        let common_checks = {
+            // Compute the transition commitment as `Hash(tvk)`.
+            let tcm = A::hash_psd2(std::slice::from_ref(&self.tvk));
+            input_checks & tpk.is_equal(&candidate_tpk) & tcm.is_equal(&self.tcm)
+        };
+
+        // Checks for an ordinary signer.
+        let ordinary_checks = {
+            // Compute the signer commitment as `Hash(signer || root_tvk)`.
+            let scm = A::hash_psd2(&[self.signer.to_field(), root_tvk.clone()]);
+
+            // Construct the hash input as (r * G, pk_sig, pr_sig, address, message).
+            let pr_sig = self.signature.compute_key().pr_sig();
+            let mut preimage = Vec::with_capacity(4 + message.len());
+            preimage.extend([tpk, pk_sig, pr_sig].map(|point| point.to_x_coordinate()));
+            preimage.push(self.signer.to_field());
+            preimage.extend_from_slice(message);
+            // Compute the candidate verifier challenge.
+            let candidate_challenge = A::hash_to_scalar_psd8(&preimage);
+            // Compute the candidate address.
+            let candidate_address = self.signature.compute_key().to_address();
+
+            scm.is_equal(&self.scm)
+                & self.signature.challenge().is_equal(&candidate_challenge)
+                & self.signer.is_equal(&candidate_address)
+        };
+
+        // Checks for a program signer.
+        let program_checks = {
+            let kind = Field::constant(console::Field::from_u8(console::PROGRAM_SIGNER_KIND_SIGNER));
+            // Compute the signer commitment as `Hash(kind, Y.x, Y.y, root_tvk)`.
+            let scm = A::hash_psd2(&[kind, signer.to_x_coordinate(), signer.to_y_coordinate(), root_tvk]);
+            // Ensure `tvk == (tsk * Y).x`.
+            let tvk_check = self.tvk.is_equal(&p.to_x_coordinate());
+
+            // At the root, ensure the program has opted in and `Y == X + Ht(kind, parent, X) * G`.
+            // A program that has not opted in cannot root a program signer, so it needs no tweak.
+            let root_check = match is_opted_in {
+                true => {
+                    let tweak = program_signer::program_signer_tweak(
+                        console::PROGRAM_SIGNER_KIND_SIGNER,
+                        parent,
+                        &program_signer.internal,
+                    );
+                    let candidate_signer = &program_signer.internal + &A::g_scalar_multiply(&tweak);
+                    !is_root | signer.is_equal(&candidate_signer)
+                }
+                false => !is_root,
+            };
+
+            // If the function has record inputs, ensure `Y == y * G` and `sk_tag == Hash(graph_dom, y, 0)`.
+            // Each record input separately checks `gamma == y * H` (see `check_input_ids`).
+            let has_record_inputs =
+                input_types.iter().any(|input_type| matches!(input_type, console::ValueType::Record(..)));
+            let view_key_check = match has_record_inputs {
+                true => {
+                    let sk_tag =
+                        A::hash_psd4(&[A::graph_key_domain(), program_signer.view_key.to_field(), Field::zero()]);
+                    signer.is_equal(&A::g_scalar_multiply(&program_signer.view_key)) & self.sk_tag.is_equal(&sk_tag)
+                }
+                false => Boolean::constant(true),
+            };
+
+            scm.is_equal(&self.scm) & tvk_check & root_check & view_key_check
+        };
+
+        common_checks & Boolean::ternary(is_program, &program_checks, &ordinary_checks)
+    }
+
     /// Returns `true` if the inputs match their input IDs.
     /// Note: This method does **not** perform signature checks.
     ///
@@ -134,6 +269,7 @@ impl<A: Aleo> Request<A> {
         tcm: &Field<A>,
         signature: Option<&Signature<A>>,
         function_id: Option<Field<A>>,
+        program_signer: Option<(&Boolean<A>, &Scalar<A>)>,
     ) -> (Boolean<A>, Option<Vec<Field<A>>>) {
         // Ensure the signature response matches the `CREATE_MESSAGE` flag.
         match CREATE_MESSAGE {
@@ -276,6 +412,9 @@ impl<A: Aleo> Request<A> {
                         let candidate_tag =
                             Record::<A, Plaintext<A>>::tag(sk_tag.clone(), candidate_commitment.clone());
 
+                        // For a program signer, `gamma` must be `y * H`.
+                        let mut gamma_check = Boolean::constant(true);
+
                         if CREATE_MESSAGE {
                             // Ensure the signature is declared.
                             let signature = match signature {
@@ -284,13 +423,24 @@ impl<A: Aleo> Request<A> {
                             };
                             // Retrieve the challenge from the signature.
                             let challenge = signature.challenge();
-                            // Retrieve the response from the signature.
-                            let response = signature.response();
 
                             // Compute the generator `H` as `HashToGroup(commitment)`.
                             let h = A::hash_to_group_psd2(&[A::serial_number_domain(), candidate_commitment.clone()]);
-                            // Compute `h_r` as `(challenge * gamma) + (response * H)`, equivalent to `r * H`.
-                            let h_r = (gamma.deref() * challenge) + (&h * response);
+                            let h_r = match program_signer {
+                                None => {
+                                    // Retrieve the response from the signature.
+                                    let response = signature.response();
+                                    // Compute `h_r` as `(challenge * gamma) + (response * H)`, equivalent to `r * H`.
+                                    (gamma.deref() * challenge) + (&h * response)
+                                }
+                                // The scalar is the signature response for an ordinary signer, and `y` for a program signer.
+                                Some((is_program, scalar)) => {
+                                    let scalar_h = &h * scalar;
+                                    gamma_check = !is_program | gamma.deref().is_equal(&scalar_h);
+                                    // Compute `h_r` as `(challenge * gamma) + (response * H)`, equivalent to `r * H`.
+                                    (gamma.deref() * challenge) + scalar_h
+                                }
+                            };
 
                             // Add (`H`, `r * H`, `gamma`, `tag`) to the message.
                             message.extend([h, h_r, *gamma.clone()].iter().map(|point| point.to_x_coordinate()));
@@ -305,6 +455,8 @@ impl<A: Aleo> Request<A> {
                             & tag.is_equal(&candidate_tag)
                             // Ensure the record belongs to the signer.
                             & record.owner().deref().is_equal(signer)
+                            // Ensure `gamma` is `y * H` for a program signer.
+                            & gamma_check
                     }
                     // An external record input is hashed (using `tvk`) to a field element.
                     InputID::ExternalRecord(input_hash) => {
@@ -506,11 +658,19 @@ mod tests {
             let request = Request::<Circuit>::new(mode, request);
             let is_root = Boolean::new(mode, is_root);
             let program_checksum = program_checksum.map(|hash| Field::<Circuit>::new(mode, hash));
+            let parent = Address::<Circuit>::new(mode, request.program_id().eject_value().to_address()?);
+            let is_opted_in = console::program_signer_opt_in(&request.program_id().eject_value());
 
             Circuit::scope(format!("Request {i}"), || {
                 let root_tvk = None;
-                let candidate = request.verify(&input_types, &tpk, root_tvk, is_root, program_checksum);
+                let candidate =
+                    request.verify(&input_types, &tpk, root_tvk, is_root, program_checksum, &parent, is_opted_in);
                 assert!(candidate.eject_value());
+                // The counts below are for the circuit without program signers.
+                // See `program_signer::tests` for the counts with program signers.
+                if PROGRAM_SIGNER_CIRCUIT {
+                    return;
+                }
                 count.assert_matches(
                     Circuit::num_constants_in_scope(),
                     Circuit::num_public_in_scope(),
@@ -562,6 +722,7 @@ mod tests {
                     request.tcm(),
                     None,
                     function_id,
+                    None,
                 );
                 assert!(candidate.eject_value());
                 expected_count.assert_matches(
