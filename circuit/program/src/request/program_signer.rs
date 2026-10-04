@@ -340,6 +340,29 @@ mod tests {
         let (token_request, input_types) = sample_program(&token_signer, "token.aleo", true, true, rng);
         assert!(!verify_in_circuit(&token_request, &input_types, None, true, "token.aleo").0);
 
+        // HAZARD (documented, not a bug in isolation): a *child* request in program kind for an ordinary address `A`,
+        // proven with `A`'s view key, verifies on its own and yields a different serial number for `A`'s record than
+        // the ordinary path (`gamma = vk * H` instead of `sk_sig * H`). Only the execution-wide checks stop it: the
+        // verifier requires one `scm` per execution, and the root must prove `A == X + Ht(kind, P, X) * G`.
+        {
+            let account = snarkvm_console_account::PrivateKey::<CurrentNetwork>::new(rng).unwrap();
+            let address = console::Address::try_from(&account).unwrap();
+            let view_key = snarkvm_console_account::ViewKey::try_from(&account).unwrap();
+            let vault = console::ProgramID::from_str("vault.aleo").unwrap();
+            let impostor = console::ProgramSigner::from_parts_unchecked(
+                vault,
+                console::PROGRAM_SIGNER_KIND_SIGNER,
+                console::Group::rand(rng),
+                *view_key,
+                address,
+            );
+            let (child, input_types) = sample_program(&impostor, "token.aleo", true, false, rng);
+            assert!(verify_in_circuit(&child, &input_types, None, false, "vault.aleo").0);
+            // At the root, the tweak check rejects it.
+            let (root, input_types) = sample_program(&impostor, "vault.aleo", true, true, rng);
+            assert!(!verify_in_circuit(&root, &input_types, None, true, "vault.aleo").0);
+        }
+
         // Dropping the program signer witness (claiming the ordinary kind) fails the signature check.
         let flipped =
             rebuild(&request, request.input_ids().to_vec(), *request.sk_tag(), *request.tvk(), *request.tcm(), None);

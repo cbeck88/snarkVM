@@ -181,6 +181,19 @@ impl<N: Network> ProgramSigner<N> {
         Ok(Self { program_id, kind, internal, view_key, address })
     }
 
+    /// Initializes a program signer with an arbitrary address and no checks.
+    /// This exists to construct invalid signers in negative tests.
+    #[doc(hidden)]
+    pub fn from_parts_unchecked(
+        program_id: ProgramID<N>,
+        kind: u8,
+        internal: Group<N>,
+        view_key: Scalar<N>,
+        address: Address<N>,
+    ) -> Self {
+        Self { program_id, kind, internal, view_key, address }
+    }
+
     /// Returns the program that owns the address.
     pub const fn program_id(&self) -> &ProgramID<N> {
         &self.program_id
