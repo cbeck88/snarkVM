@@ -105,3 +105,75 @@ function tweak:
         assert_eq!(response.outputs()[1], Value::Plaintext(Plaintext::from(Literal::Group(**signer.address()))));
     }
 }
+
+/// Synthesizes `program_id/function_name` in `CheckDeployment` mode with the given request signer,
+/// as the root (`caller == None`) or as a child of `caller`, and returns
+/// `(public, private, constraints, nonzeros)` of the function circuit.
+fn measure_function(
+    process: &crate::Process<CurrentNetwork>,
+    program_id: &str,
+    function_name: &str,
+    signer: &console::program::RequestSigner<CurrentNetwork>,
+    caller: Option<&str>,
+    rng: &mut TestRng,
+) -> (u64, u64, u64, (u64, u64, u64)) {
+    use crate::Authorization;
+    use console::program::{ProgramID, Request};
+    use snarkvm_synthesizer_program::StackTrait;
+
+    let program_id = ProgramID::<CurrentNetwork>::from_str(program_id).unwrap();
+    let function_name = Identifier::<CurrentNetwork>::from_str(function_name).unwrap();
+    let stack = process.get_stack(program_id).unwrap();
+    let input_types = stack.get_function(&function_name).unwrap().input_types();
+    let address = signer.address().unwrap();
+    let inputs = input_types
+        .iter()
+        .map(|input_type| stack.sample_value(&address, &input_type.into(), rng))
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+    let caller = caller.map(|caller| ProgramID::<CurrentNetwork>::from_str(caller).unwrap());
+    let root_tvk = caller.map(|_| console::types::Field::rand(rng));
+    let request: Request<CurrentNetwork> = signer
+        .sign(program_id, function_name, inputs.into_iter(), &input_types, root_tvk, caller.is_none(), None, false, rng)
+        .unwrap();
+    let assignments = std::sync::Arc::new(parking_lot::RwLock::new(Vec::new()));
+    let burner = PrivateKey::<CurrentNetwork>::new(rng).unwrap();
+    let call_stack = CallStack::CheckDeployment(vec![request], burner, assignments.clone(), None, None, None);
+    stack.execute_function::<CurrentAleo, _>(call_stack, caller, root_tvk, rng).unwrap();
+    let assignments = assignments.read();
+    let (assignment, _) = assignments.last().unwrap();
+    (assignment.num_public(), assignment.num_private(), assignment.num_constraints(), assignment.num_nonzeros())
+}
+
+/// Prints the circuit sizes of `credits.aleo` functions with ordinary and program signers.
+/// Run with and without the `program-signer` feature to compare.
+#[test]
+fn test_program_signer_measure_credits() {
+    let rng = &mut TestRng::default();
+    let process = crate::Process::<CurrentNetwork>::load().unwrap();
+    let account = console::program::RequestSigner::Account(PrivateKey::new(rng).unwrap());
+    let vault = console::program::ProgramID::<CurrentNetwork>::from_str("vault.aleo").unwrap();
+    let program_signer = console::program::RequestSigner::Program(
+        ProgramSigner::from_internal_secret(vault, Scalar::rand(rng)).unwrap(),
+    );
+    let feature = if cfg!(feature = "program-signer") { "on" } else { "off" };
+
+    for function_name in ["transfer_private", "transfer_public", "join", "transfer_private_to_public"] {
+        let root = measure_function(&process, "credits.aleo", function_name, &account, None, rng);
+        let child = measure_function(&process, "credits.aleo", function_name, &account, Some("vault.aleo"), rng);
+        println!(
+            "MEASURE feature={feature} credits.aleo/{function_name} ordinary root  (public, private, constraints, nonzeros) = {root:?}"
+        );
+        println!(
+            "MEASURE feature={feature} credits.aleo/{function_name} ordinary child (public, private, constraints, nonzeros) = {child:?}"
+        );
+        if cfg!(feature = "program-signer") {
+            let program =
+                measure_function(&process, "credits.aleo", function_name, &program_signer, Some("vault.aleo"), rng);
+            println!(
+                "MEASURE feature={feature} credits.aleo/{function_name} program  child (public, private, constraints, nonzeros) = {program:?}"
+            );
+            assert_eq!(child, program);
+        }
+    }
+}
