@@ -47,6 +47,7 @@ use snarkvm_utilities::TestRng;
 fn vault_program(name: &str) -> Program<CurrentNetwork> {
     let domain = program_signer_tweak_domain::<CurrentNetwork>();
     let kind = PROGRAM_SIGNER_KIND_SIGNER;
+    let aleo = Identifier::<CurrentNetwork>::from_str("aleo").unwrap().to_field().unwrap();
     Program::from_str(&format!(
         r"
 import credits.aleo;
@@ -56,6 +57,14 @@ program {name}.aleo;
 struct approval:
     vault as address;
     nonce as u64;
+    recipient as address;
+    amount as u64;
+
+struct dynamic_approval:
+    vault as address;
+    nonce as u64;
+    target_program as field;
+    target_function as field;
     recipient as address;
     amount as u64;
 
@@ -129,6 +138,37 @@ function execute_transfer:
     output r20 as config.record;
     output r17 as credits.aleo/credits.record;
     output r18 as credits.aleo/credits.record;
+
+// Calls any approved target `program/function(record, recipient, amount)` with a vault-owned record, given k-of-3
+// approvals over the target, as well as the other inputs.
+function execute_dynamic:
+    input r0 as config.record;
+    input r1 as dynamic.record;
+    input r2 as field.private;
+    input r3 as field.private;
+    input r4 as address.private;
+    input r5 as u64.private;
+    input r6 as signature.private;
+    input r7 as signature.private;
+    input r8 as signature.private;
+    assert.eq self.caller self.signer;
+    cast self.signer r0.nonce r2 r3 r4 r5 into r9 as dynamic_approval;
+    sign.verify r6 r0.signer0 r9 into r10;
+    sign.verify r7 r0.signer1 r9 into r11;
+    sign.verify r8 r0.signer2 r9 into r12;
+    ternary r10 1u8 0u8 into r13;
+    ternary r11 1u8 0u8 into r14;
+    ternary r12 1u8 0u8 into r15;
+    add r13 r14 into r16;
+    add r16 r15 into r17;
+    gte r17 r0.threshold into r18;
+    assert.eq r18 true;
+    call.dynamic r2 {aleo} r3 with r1 r4 r5 (as dynamic.record address.private u64.private) into r19 r20 (as dynamic.record dynamic.record);
+    add r0.nonce 1u64 into r21;
+    cast r0.owner r0.signer0 r0.signer1 r0.signer2 r0.threshold r21 into r22 as config.record;
+    output r22 as config.record;
+    output r19 as dynamic.record;
+    output r20 as dynamic.record;
 
 constructor:
     assert.eq edition 0u16;
@@ -360,6 +400,43 @@ fn test_program_signer_vault_end_to_end() {
         let tvk = (*transition.tpk() * *vault_view_key).to_x_coordinate();
         assert_eq!(*transition.tcm(), <CurrentNetwork as Network>::hash_psd2(&[tvk]).unwrap());
     }
+
+    // With 2-of-3 approvals over the target, the vault calls `credits.aleo/transfer_private` with `call.dynamic`,
+    // passing its change record as a `dynamic.record`.
+    let config = vault_records.iter().find(|record| microcredits(record).is_none()).unwrap().clone();
+    let change_record = vault_records.iter().find(|record| microcredits(record).is_some()).unwrap().clone();
+    let credits_field = Identifier::<CurrentNetwork>::from_str("credits").unwrap().to_field().unwrap();
+    let transfer_field = Identifier::<CurrentNetwork>::from_str("transfer_private").unwrap().to_field().unwrap();
+    let dynamic_amount = 500_000u64;
+    let dynamic_approve = |private_key: &PrivateKey<CurrentNetwork>, rng: &mut TestRng| {
+        let message = Plaintext::<CurrentNetwork>::from_str(&format!(
+            "{{ vault: {vault_address}, nonce: 1u64, target_program: {credits_field}, target_function: {transfer_field}, recipient: {bob_address}, amount: {dynamic_amount}u64 }}"
+        ))
+        .unwrap();
+        let signature = Signature::sign(private_key, &message.to_fields().unwrap(), rng).unwrap();
+        Value::from(Literal::Signature(Box::new(signature)))
+    };
+    let inputs = [
+        Value::Record(config),
+        Value::Record(change_record),
+        Value::from(Literal::Field(credits_field)),
+        Value::from(Literal::Field(transfer_field)),
+        Value::from(Literal::Address(bob_address)),
+        Value::from(Literal::U64(U64::new(dynamic_amount))),
+        dynamic_approve(&bogus, rng),
+        dynamic_approve(&signers[1], rng),
+        dynamic_approve(&signers[2], rng),
+    ];
+    let authorization = vm.authorize_with_signer(&vault_signer, "vault.aleo", "execute_dynamic", inputs, rng).unwrap();
+    assert_eq!(authorization.len(), 2, "vault.aleo/execute_dynamic and credits.aleo/transfer_private");
+    let transaction = execute_with_fee(&vm, &genesis, authorization, rng);
+    assert_all_accepted(&add_block(&vm, &genesis, std::slice::from_ref(&transaction), rng), 1);
+    let bob_records = owned_records(&transaction, &bob_view_key);
+    assert_eq!(bob_records.iter().filter_map(microcredits).collect::<Vec<_>>(), vec![dynamic_amount]);
+    let vault_records = owned_records(&transaction, &vault_view_key);
+    assert_eq!(vault_records.iter().filter_map(microcredits).collect::<Vec<_>>(), vec![
+        3_000_000 - amount - dynamic_amount
+    ]);
 
     // An ordinary execution still works after the vault's executions.
     let inputs = [Value::from(Literal::Address(bob_address)), Value::from(Literal::U64(U64::new(1)))];
