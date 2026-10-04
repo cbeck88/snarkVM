@@ -37,9 +37,9 @@ use console::{
         Value,
         program_signer_tweak_domain,
     },
-    types::{Scalar, U64},
+    types::{Field, Group, Scalar, U64},
 };
-use snarkvm_ledger_block::{Block, Transaction};
+use snarkvm_ledger_block::{Block, Execution, Transaction, Transition};
 use snarkvm_synthesizer_program::Program;
 use snarkvm_utilities::TestRng;
 
@@ -293,6 +293,7 @@ fn test_program_signer_vault_end_to_end() {
     let authorization = vm.authorize(&alice, "credits.aleo", "transfer_private", inputs, rng).unwrap();
     let transaction = execute_with_fee(&vm, &genesis, authorization, rng);
     assert_all_accepted(&add_block(&vm, &genesis, std::slice::from_ref(&transaction), rng), 1);
+    let funding_transaction = transaction.clone();
     // The record sent to `Y` decrypts with `y`.
     let vault_credits = owned_records(&transaction, &vault_view_key).pop().unwrap();
     assert_eq!(microcredits(&vault_credits), Some(3_000_000));
@@ -384,6 +385,72 @@ fn test_program_signer_vault_end_to_end() {
         vm.authorize_with_signer(&vault_signer, "vault.aleo", "execute_transfer", two_approvals, rng).unwrap();
     assert_eq!(authorization.len(), 2, "vault.aleo/execute_transfer and credits.aleo/transfer_private");
     let transaction = execute_with_fee(&vm, &genesis, authorization, rng);
+
+    // Execution-wide checks, at VM level: rebuild the valid vault transaction with one transition altered,
+    // and confirm the verifier rejects it. A transition's ID commits to neither `scm` nor `tpk`
+    // (`id = hash(function_tree_root, tcm)`), so the altered transaction keeps the same IDs and fee binding,
+    // and only the verifier's checks stand in the way.
+    {
+        let execution = transaction.execution().unwrap().clone();
+        let fee = transaction.fee_transition();
+        let ordinary = funding_transaction.execution().unwrap().transitions().next().unwrap().clone();
+        let rebuild = |index: usize, scm: Option<Field<CurrentNetwork>>, tpk: Option<Group<CurrentNetwork>>| {
+            let transitions: Vec<_> = execution
+                .transitions()
+                .enumerate()
+                .map(|(i, t)| {
+                    if i != index {
+                        return t.clone();
+                    }
+                    Transition::new(
+                        *t.program_id(),
+                        *t.function_name(),
+                        t.inputs().to_vec(),
+                        t.outputs().to_vec(),
+                        tpk.unwrap_or(*t.tpk()),
+                        *t.tcm(),
+                        scm.unwrap_or(*t.scm()),
+                    )
+                    .unwrap()
+                })
+                .collect();
+            let altered =
+                Execution::from(transitions.into_iter(), execution.global_state_root(), execution.proof().cloned())
+                    .unwrap();
+            Transaction::from_execution(altered, fee.clone()).unwrap()
+        };
+        // The child (credits.aleo/transfer_private, index 0 in post-order) and the root (index 1).
+        assert_eq!(execution.transitions().next().unwrap().program_id().to_string(), "credits.aleo");
+
+        // (1) Single-`scm` rule: a child whose signer commitment differs from the root's is rejected before any
+        // proof is checked. This is the case of a lone program-kind child for an ordinary address, or a child signed
+        // as `-Y`: either way its `scm` cannot equal the root's (`Hash(kind, Y.x, Y.y, root_tvk)`).
+        for (label, scm) in [("ordinary signer's scm", *ordinary.scm()), ("unrelated scm", Field::rand(rng))] {
+            let altered = rebuild(0, Some(scm), None);
+            let error = vm.check_transaction(&altered, None, rng).expect_err(label);
+            println!("child with {label}: {error:?}");
+            assert!(format!("{error:?}").contains("same signer"), "{label}: rejected by the single-scm rule");
+        }
+
+        // (2) `tpk` squatting: copy the `tpk` of a *pending* ordinary transaction (built but not yet in the ledger,
+        // so the ledger's duplicate-`tpk` check does not fire). The altered vault transaction fails proof
+        // verification, because `tpk = tsk·G` is constrained in the circuit and `tpk` is a public input.
+        let inputs = [Value::from(Literal::Address(bob_address)), Value::from(Literal::U64(U64::new(7)))];
+        let pending = vm
+            .execute(&genesis, ("credits.aleo", "transfer_public_to_private"), inputs.iter(), None, 0, None, rng)
+            .unwrap();
+        let victim_tpk = *pending.transitions().next().unwrap().tpk();
+        for index in [0, 1] {
+            let altered = rebuild(index, None, Some(victim_tpk));
+            let error = vm.check_transaction(&altered, None, rng).expect_err("squatted tpk");
+            println!("transition {index} with a pending transaction's tpk: {error:?}");
+            assert!(!format!("{error:?}").contains("already exists"), "must fail on the proof, not the ledger");
+        }
+
+        // The unaltered transaction still verifies.
+        vm.check_transaction(&transaction, None, rng).unwrap();
+    }
+
     assert_all_accepted(&add_block(&vm, &genesis, std::slice::from_ref(&transaction), rng), 1);
 
     // Bob receives the amount.
