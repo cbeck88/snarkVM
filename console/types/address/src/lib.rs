@@ -21,6 +21,7 @@ mod bytes;
 mod from_bits;
 mod from_field;
 mod from_fields;
+mod marker;
 mod parse;
 mod random;
 mod serialize;
@@ -30,6 +31,8 @@ mod to_bits;
 mod to_field;
 mod to_fields;
 mod to_group;
+
+pub use marker::AddressMarker;
 
 pub use snarkvm_console_network_environment::prelude::*;
 pub use snarkvm_console_types_boolean::Boolean;
