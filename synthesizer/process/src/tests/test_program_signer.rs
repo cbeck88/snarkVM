@@ -15,7 +15,7 @@
 
 //! Tests for program-owned signers (exploratory prototype).
 
-use crate::CallStack;
+use crate::{Assignments, CallStack};
 use circuit::network::AleoV0;
 use console::{
     account::PrivateKey,
@@ -144,7 +144,7 @@ fn measure_function(
     let request: Request<CurrentNetwork> = signer
         .sign(program_id, function_name, inputs.into_iter(), &input_types, root_tvk, caller.is_none(), None, false, rng)
         .unwrap();
-    let assignments = std::sync::Arc::new(parking_lot::RwLock::new(Vec::new()));
+    let assignments = Assignments::<CurrentNetwork>::default();
     let call_stack = CallStack::CheckDeployment(vec![request], burner, assignments.clone(), None, None, None);
     stack.execute_function::<CurrentAleo, _>(call_stack, caller, root_tvk, rng).unwrap();
     let assignments = assignments.read();
