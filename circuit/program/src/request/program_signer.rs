@@ -368,4 +368,114 @@ mod tests {
             rebuild(&request, request.input_ids().to_vec(), *request.sk_tag(), *request.tvk(), *request.tcm(), None);
         assert!(!verify_in_circuit(&flipped, &input_types, None, true, "vault.aleo").0);
     }
+
+    /// HAZARD (documented, not a bug in isolation): a *child* request in program kind with no record inputs, for an
+    /// arbitrary ordinary address `A`, verifies on its own with no secret of `A` at all: there is no tweak check off
+    /// the root, and `Y == y * G` is only enforced when the function has record inputs. Only the execution-wide
+    /// checks stop it (one `scm` per execution, and the root tweak).
+    #[test]
+    fn test_program_signer_lone_child_without_records_needs_no_secret() {
+        let rng = &mut TestRng::default();
+        let account = snarkvm_console_account::PrivateKey::<CurrentNetwork>::new(rng).unwrap();
+        let address = console::Address::try_from(&account).unwrap();
+        let vault = console::ProgramID::from_str("vault.aleo").unwrap();
+        // The impostor knows only the public address: `X` and `y` are random.
+        let impostor = console::ProgramSigner::from_parts_unchecked(
+            vault,
+            console::PROGRAM_SIGNER_KIND_SIGNER,
+            console::Group::rand(rng),
+            console::Scalar::rand(rng),
+            address,
+        );
+
+        // As a child with no record inputs (e.g. 'credits.aleo/transfer_public_as_signer'), the request is accepted.
+        let (child, input_types) = sample_program(&impostor, "credits.aleo", false, false, rng);
+        assert_eq!(*child.signer(), address);
+        assert!(verify_in_circuit(&child, &input_types, None, false, "vault.aleo").0);
+
+        // With a record input, the random `y` is rejected (`Y != y * G`): that case needs the view key of `A`.
+        let (child, input_types) = sample_program(&impostor, "token.aleo", true, false, rng);
+        assert!(!verify_in_circuit(&child, &input_types, None, false, "vault.aleo").0);
+
+        // As a root (e.g. a fee) in a program that has not opted in, it is rejected.
+        let (root, input_types) = sample_program(&impostor, "credits.aleo", false, true, rng);
+        assert!(!verify_in_circuit(&root, &input_types, None, true, "credits.aleo").0);
+    }
+
+    /// HAZARD (existing behaviour, wider reach with program signers): `tcm` must be unique network-wide, but an
+    /// ordinary request only constrains `tvk` by `tcm == Hash(tvk)`. A holder of the vault view key `y` recovers a
+    /// pending vault transition's `tvk` from its public `tpk`, and signs an unrelated ordinary request, with their own
+    /// account, that has the same `tvk` and so the same `tcm`. Whichever transaction lands second is aborted.
+    #[test]
+    fn test_program_signer_tcm_squat_by_view_key_holder() {
+        use console::Network as _;
+        use snarkvm_console_account::{ComputeKey, GraphKey, PrivateKey, Signature, ViewKey};
+
+        let rng = &mut TestRng::default();
+
+        // The victim: a pending vault transition (program kind, at the root of 'vault.aleo').
+        let vault = sample_vault_signer(rng);
+        let (victim, victim_types) = sample_program(&vault, "vault.aleo", false, true, rng);
+        assert!(verify_in_circuit(&victim, &victim_types, None, true, "vault.aleo").0);
+
+        // The squatter sees `tpk` in the mempool and holds `y`.
+        let tvk = (victim.to_tpk() * *vault.view_key()).to_x_coordinate();
+        assert_eq!(tvk, *victim.tvk());
+        let tcm = CurrentNetwork::hash_psd2(&[tvk]).unwrap();
+        assert_eq!(tcm, *victim.tcm());
+
+        // The squatter's own account signs a request for another program, using the victim's `tvk`.
+        let private_key = PrivateKey::<CurrentNetwork>::new(rng).unwrap();
+        let compute_key = ComputeKey::try_from(&private_key).unwrap();
+        let signer = console::Address::try_from(&private_key).unwrap();
+        let sk_tag = GraphKey::try_from(ViewKey::try_from(&private_key).unwrap()).unwrap().sk_tag();
+        let program_id = console::ProgramID::<CurrentNetwork>::from_str("token.aleo").unwrap();
+        let function_name = console::Identifier::<CurrentNetwork>::from_str("foo").unwrap();
+        let network_id = console::U16::new(CurrentNetwork::ID);
+        let function_id = console::compute_function_id(&network_id, &program_id, &function_name).unwrap();
+        let (inputs, input_types) = sample_inputs(signer, false);
+        let input_ids = vec![
+            console::InputID::public(function_id, &inputs[0], tcm, 0).unwrap(),
+            console::InputID::private(function_id, &inputs[1], tvk, 1).unwrap(),
+        ];
+
+        // Sign `(r * G, pk_sig, pr_sig, signer, [tvk, tcm, function ID, is_root, input IDs])` by hand, because
+        // `Request::sign` derives `tvk` from its own nonce.
+        let r = console::Scalar::<CurrentNetwork>::rand(rng);
+        let g_r = CurrentNetwork::g_scalar_multiply(&r);
+        let mut message = vec![
+            g_r.to_x_coordinate(),
+            compute_key.pk_sig().to_x_coordinate(),
+            compute_key.pr_sig().to_x_coordinate(),
+            signer.to_x_coordinate(),
+            tvk,
+            tcm,
+            function_id,
+            console::Field::one(),
+        ];
+        message.extend(input_ids.iter().map(|input_id| *input_id.id()));
+        let challenge = CurrentNetwork::hash_to_scalar_psd8(&message).unwrap();
+        let response = r - challenge * private_key.sk_sig();
+        let signature = Signature::from((challenge, response, compute_key));
+        let scm = CurrentNetwork::hash_psd2(&[signer.to_x_coordinate(), tvk]).unwrap();
+        let squat = console::Request::from((
+            signer,
+            network_id,
+            program_id,
+            function_name,
+            input_ids,
+            inputs,
+            signature,
+            sk_tag,
+            tvk,
+            tcm,
+            scm,
+            false,
+        ));
+
+        // The squatter's request has its own `tpk`, the victim's `tcm`, and is accepted.
+        assert_ne!(squat.to_tpk(), victim.to_tpk());
+        assert_eq!(squat.tcm(), victim.tcm());
+        assert!(verify_in_circuit(&squat, &input_types, None, true, "token.aleo").0);
+    }
 }
