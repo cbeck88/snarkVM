@@ -52,7 +52,9 @@ impl<N: Network> FromBytes for RejectedReason<N> {
                 };
                 Ok(Self::VM(program_id, resource))
             }
-            3.. => Err(error(format!("Failed to decode rejected reason variant {variant}"))),
+            3 => Ok(Self::Verification),
+            4 => Ok(Self::Precondition),
+            5.. => Err(error(format!("Failed to decode rejected reason variant {variant}"))),
         }
     }
 }
@@ -93,6 +95,8 @@ impl<N: Network> ToBytes for RejectedReason<N> {
                     }
                 }
             }
+            Self::Verification => 3u8.write_le(&mut writer),
+            Self::Precondition => 4u8.write_le(&mut writer),
         }
     }
 }
