@@ -28,7 +28,7 @@ use console::{
     types::U16,
 };
 use snarkvm_ledger_authority::Authority;
-use snarkvm_ledger_block::{Block, ConfirmedTransaction, Execution, Ratify, Rejected, Transaction};
+use snarkvm_ledger_block::{Block, ConfirmedTransaction, Execution, Ratify, Rejected, RejectedReason, Transaction};
 use snarkvm_ledger_committee::{Committee, MIN_VALIDATOR_STAKE};
 use snarkvm_ledger_narwhal::{BatchHeader, Data, Subdag, Transmission, TransmissionID};
 use snarkvm_ledger_store::ConsensusStore;
@@ -3977,4 +3977,292 @@ fn test_find_records_filters_by_ownership() {
     // Ensure that no records were returned for the unrelated view key.
     // This validates that ownership filtering is enforced before decrypting or filtering records.
     assert!(unrelated_records.is_empty(), "Expected no records for unrelated view key");
+}
+
+/// Advances the ledger with empty beacon blocks until it reaches the given height.
+fn advance_ledger_to_height(
+    ledger: &CurrentLedger,
+    private_key: &PrivateKey<CurrentNetwork>,
+    height: u32,
+    rng: &mut TestRng,
+) {
+    while ledger.latest_height() < height {
+        let block = ledger.prepare_advance_to_next_beacon_block(private_key, vec![], vec![], vec![], rng).unwrap();
+        ledger.advance_to_next_block(&block).unwrap();
+    }
+}
+
+/// Returns a copy of the given execution transaction whose execution proof is replaced by the proof of
+/// `other`. The transaction ID, execution ID, and fee are unchanged, so the fee still verifies, but the
+/// execution no longer does.
+fn malleate_execution_proof(
+    transaction: &Transaction<CurrentNetwork>,
+    other: &Transaction<CurrentNetwork>,
+) -> Transaction<CurrentNetwork> {
+    let execution = transaction.execution().unwrap();
+    let malleated = Execution::from(
+        execution.transitions().cloned(),
+        execution.global_state_root(),
+        other.execution().unwrap().proof().cloned(),
+    )
+    .unwrap();
+    let malleated = Transaction::from_execution(malleated, transaction.fee_transition()).unwrap();
+    assert_eq!(malleated.id(), transaction.id());
+    assert_ne!(&malleated, transaction);
+    malleated
+}
+
+/// Returns the public balance of the given address.
+fn public_balance(ledger: &CurrentLedger, address: &Address<CurrentNetwork>) -> u64 {
+    let value = ledger
+        .vm()
+        .finalize_store()
+        .get_value_confirmed(
+            ProgramID::from_str("credits.aleo").unwrap(),
+            Identifier::from_str("account").unwrap(),
+            &Plaintext::from(Literal::Address(*address)),
+        )
+        .unwrap();
+    match value {
+        Some(Value::Plaintext(Plaintext::Literal(Literal::U64(balance), _))) => *balance,
+        _ => 0,
+    }
+}
+
+/// Returns a `transfer_public` of `amount` from `private_key` to `recipient`.
+fn transfer_public(
+    ledger: &CurrentLedger,
+    private_key: &PrivateKey<CurrentNetwork>,
+    recipient: &Address<CurrentNetwork>,
+    amount: &str,
+    rng: &mut TestRng,
+) -> Transaction<CurrentNetwork> {
+    let inputs = [Value::from_str(&recipient.to_string()).unwrap(), Value::from_str(amount).unwrap()];
+    ledger
+        .vm()
+        .execute(private_key, ("credits.aleo", "transfer_public"), inputs.into_iter(), None, 0, None, rng)
+        .unwrap()
+}
+
+#[test]
+fn test_unverifiable_execution_is_rejected_from_v23() {
+    let rng = &mut TestRng::default();
+
+    // Initialize the test environment, and advance to `ConsensusVersion::V23`.
+    let crate::test_helpers::TestEnv { ledger, private_key, address, .. } = crate::test_helpers::sample_test_env(rng);
+    advance_ledger_to_height(
+        &ledger,
+        &private_key,
+        CurrentNetwork::CONSENSUS_HEIGHT(ConsensusVersion::V23).unwrap(),
+        rng,
+    );
+
+    // Sample a recipient.
+    let recipient = Address::try_from(&PrivateKey::<CurrentNetwork>::new(rng).unwrap()).unwrap();
+
+    // Create a valid transfer, and a transfer whose execution proof is malleated but whose fee is valid.
+    let valid = transfer_public(&ledger, &private_key, &recipient, "1u64", rng);
+    let original = transfer_public(&ledger, &private_key, &recipient, "2u64", rng);
+    let malleated = malleate_execution_proof(&original, &valid);
+    assert!(ledger.vm().check_transaction(&malleated, None, rng).is_err());
+
+    // Create a block: the malleated transaction is rejected with its fee charged, not aborted.
+    let balance = public_balance(&ledger, &address);
+    let block = ledger
+        .prepare_advance_to_next_beacon_block(&private_key, vec![], vec![], vec![valid.clone(), malleated.clone()], rng)
+        .unwrap();
+    assert_eq!(block.transactions().num_accepted(), 1);
+    assert_eq!(block.transactions().num_rejected(), 1);
+    assert!(block.aborted_transaction_ids().is_empty());
+    let rejected = block.transactions().iter().find(|tx| tx.is_rejected()).unwrap();
+    assert_eq!(rejected.to_unconfirmed_transaction_id().unwrap(), original.id());
+    assert_eq!(rejected.to_unconfirmed_transaction().unwrap(), malleated);
+
+    // Check that the block round-trips through `check_next_block`, and add it to the ledger.
+    ledger.check_next_block(&block, rng).unwrap();
+    ledger.advance_to_next_block(&block).unwrap();
+
+    // Check the rejection reason, and that the fee was charged but the malleated transfer was not applied.
+    let rejected_id = *rejected.id();
+    assert_eq!(
+        ledger.vm().finalize_store().get_rejected_reason(&rejected_id).unwrap(),
+        Some(RejectedReason::Verification)
+    );
+    let fees = *valid.fee_amount().unwrap() + *original.fee_amount().unwrap();
+    assert_eq!(public_balance(&ledger, &address), balance - 1 - fees);
+    assert_eq!(public_balance(&ledger, &recipient), 1);
+
+    // The original transaction can no longer be included, as its execution was rejected.
+    assert!(ledger.contains_transaction_id(&original.id()).unwrap());
+    assert!(ledger.vm().check_transaction(&original, None, rng).is_err());
+}
+
+#[test]
+fn test_unverifiable_execution_is_aborted_before_v23() {
+    let rng = &mut TestRng::default();
+
+    // Initialize the test environment (before `ConsensusVersion::V23`).
+    let crate::test_helpers::TestEnv { ledger, private_key, address, .. } = crate::test_helpers::sample_test_env(rng);
+    assert!(CurrentNetwork::CONSENSUS_VERSION(ledger.latest_height() + 1).unwrap() < ConsensusVersion::V23);
+
+    // Sample a recipient.
+    let recipient = Address::try_from(&PrivateKey::<CurrentNetwork>::new(rng).unwrap()).unwrap();
+
+    // Create a valid transfer, and a transfer whose execution proof is malleated but whose fee is valid.
+    let valid = transfer_public(&ledger, &private_key, &recipient, "1u64", rng);
+    let original = transfer_public(&ledger, &private_key, &recipient, "2u64", rng);
+    let malleated = malleate_execution_proof(&original, &valid);
+
+    // Create a block: the malleated transaction is aborted, and nothing is charged.
+    let balance = public_balance(&ledger, &address);
+    let block = ledger
+        .prepare_advance_to_next_beacon_block(&private_key, vec![], vec![], vec![valid.clone(), malleated], rng)
+        .unwrap();
+    assert_eq!(block.transactions().num_accepted(), 1);
+    assert_eq!(block.transactions().num_rejected(), 0);
+    assert_eq!(block.aborted_transaction_ids(), &[original.id()]);
+
+    // Check that the block round-trips through `check_next_block`, and add it to the ledger.
+    ledger.check_next_block(&block, rng).unwrap();
+    ledger.advance_to_next_block(&block).unwrap();
+    assert_eq!(public_balance(&ledger, &address), balance - 1 - *valid.fee_amount().unwrap());
+
+    // The aborted transaction ID is blacklisted.
+    assert!(ledger.contains_transaction_id(&original.id()).unwrap());
+    assert!(ledger.vm().check_transaction(&original, None, rng).is_err());
+}
+
+#[test]
+fn test_duplicate_execution_with_distinct_fee_is_rejected_from_v23() {
+    let rng = &mut TestRng::default();
+
+    // Initialize the test environment, and advance to `ConsensusVersion::V23`.
+    let crate::test_helpers::TestEnv { ledger, private_key, address, .. } = crate::test_helpers::sample_test_env(rng);
+    advance_ledger_to_height(
+        &ledger,
+        &private_key,
+        CurrentNetwork::CONSENSUS_HEIGHT(ConsensusVersion::V23).unwrap(),
+        rng,
+    );
+
+    // Sample a recipient.
+    let recipient = Address::try_from(&PrivateKey::<CurrentNetwork>::new(rng).unwrap()).unwrap();
+
+    // Create a valid transfer, and a second transaction with the same execution but a distinct fee.
+    let valid = transfer_public(&ledger, &private_key, &recipient, "1u64", rng);
+    let execution = valid.execution().unwrap().clone();
+    let authorization = ledger
+        .vm()
+        .authorize_fee_public(&private_key, *valid.fee_amount().unwrap(), 0, execution.to_execution_id().unwrap(), rng)
+        .unwrap();
+    let fee = ledger.vm().execute_fee_authorization(authorization, None, rng).unwrap();
+    let duplicate = Transaction::from_execution(execution, Some(fee)).unwrap();
+    assert_ne!(duplicate.id(), valid.id());
+
+    // Create a block: the duplicate is rejected with its fee charged, not aborted.
+    let balance = public_balance(&ledger, &address);
+    let block = ledger
+        .prepare_advance_to_next_beacon_block(&private_key, vec![], vec![], vec![valid.clone(), duplicate.clone()], rng)
+        .unwrap();
+    assert_eq!(block.transactions().num_accepted(), 1);
+    assert_eq!(block.transactions().num_rejected(), 1);
+    assert!(block.aborted_transaction_ids().is_empty());
+    let rejected = block.transactions().iter().find(|tx| tx.is_rejected()).unwrap();
+    assert_eq!(rejected.to_unconfirmed_transaction_id().unwrap(), duplicate.id());
+
+    // Check that the block round-trips through `check_next_block`, and add it to the ledger.
+    ledger.check_next_block(&block, rng).unwrap();
+    ledger.advance_to_next_block(&block).unwrap();
+
+    // Check the rejection reason, and that both fees were charged but only one transfer was applied.
+    let rejected_id = *rejected.id();
+    assert_eq!(
+        ledger.vm().finalize_store().get_rejected_reason(&rejected_id).unwrap(),
+        Some(RejectedReason::Precondition)
+    );
+    let fees = *valid.fee_amount().unwrap() + *duplicate.fee_amount().unwrap();
+    assert_eq!(public_balance(&ledger, &address), balance - 1 - fees);
+    assert_eq!(public_balance(&ledger, &recipient), 1);
+}
+
+#[test]
+fn test_aborted_transaction_can_be_resubmitted_from_v23() {
+    let rng = &mut TestRng::default();
+
+    // Initialize the test environment, and advance to `ConsensusVersion::V23`.
+    let crate::test_helpers::TestEnv { ledger, private_key, .. } = crate::test_helpers::sample_test_env(rng);
+    advance_ledger_to_height(
+        &ledger,
+        &private_key,
+        CurrentNetwork::CONSENSUS_HEIGHT(ConsensusVersion::V23).unwrap(),
+        rng,
+    );
+
+    // Sample an unfunded payer and a recipient.
+    let payer_private_key = PrivateKey::<CurrentNetwork>::new(rng).unwrap();
+    let payer = Address::try_from(&payer_private_key).unwrap();
+    let recipient = Address::try_from(&PrivateKey::<CurrentNetwork>::new(rng).unwrap()).unwrap();
+
+    // Create a transfer from the unfunded payer, whose fee cannot be paid, and a transfer that funds the payer.
+    let unfunded = transfer_public(&ledger, &payer_private_key, &recipient, "1u64", rng);
+    let funding = transfer_public(&ledger, &private_key, &payer, "10000000u64", rng);
+
+    // Create a block: the fee check uses the confirmed balance, so the unfunded transfer is aborted.
+    let block = ledger
+        .prepare_advance_to_next_beacon_block(&private_key, vec![], vec![], vec![unfunded.clone(), funding], rng)
+        .unwrap();
+    assert_eq!(block.transactions().num_accepted(), 1);
+    assert_eq!(block.aborted_transaction_ids(), &[unfunded.id()]);
+    ledger.check_next_block(&block, rng).unwrap();
+    ledger.advance_to_next_block(&block).unwrap();
+
+    // The aborted transaction is recorded in its block, but is not blacklisted.
+    assert_eq!(ledger.get_aborted_transaction_ids(block.height()).unwrap(), vec![unfunded.id()]);
+    assert!(!ledger.contains_transaction_id(&unfunded.id()).unwrap());
+    assert!(ledger.vm().check_transaction(&unfunded, None, rng).is_ok());
+
+    // Resubmit the transaction: it is now accepted.
+    let block =
+        ledger.prepare_advance_to_next_beacon_block(&private_key, vec![], vec![], vec![unfunded.clone()], rng).unwrap();
+    assert_eq!(block.transactions().transaction_ids().collect::<Vec<_>>(), vec![&unfunded.id()]);
+    assert!(block.aborted_transaction_ids().is_empty());
+    ledger.check_next_block(&block, rng).unwrap();
+    ledger.advance_to_next_block(&block).unwrap();
+    assert_eq!(public_balance(&ledger, &recipient), 1);
+}
+
+#[test]
+fn test_aborted_transaction_is_blacklisted_before_v23() {
+    let rng = &mut TestRng::default();
+
+    // Initialize the test environment (before `ConsensusVersion::V23`).
+    let crate::test_helpers::TestEnv { ledger, private_key, .. } = crate::test_helpers::sample_test_env(rng);
+    assert!(CurrentNetwork::CONSENSUS_VERSION(ledger.latest_height() + 2).unwrap() < ConsensusVersion::V23);
+
+    // Sample an unfunded payer and a recipient.
+    let payer_private_key = PrivateKey::<CurrentNetwork>::new(rng).unwrap();
+    let payer = Address::try_from(&payer_private_key).unwrap();
+    let recipient = Address::try_from(&PrivateKey::<CurrentNetwork>::new(rng).unwrap()).unwrap();
+
+    // Create a transfer from the unfunded payer, whose fee cannot be paid, and a transfer that funds the payer.
+    let unfunded = transfer_public(&ledger, &payer_private_key, &recipient, "1u64", rng);
+    let funding = transfer_public(&ledger, &private_key, &payer, "10000000u64", rng);
+
+    // Create a block: the unfunded transfer is aborted.
+    let block = ledger
+        .prepare_advance_to_next_beacon_block(&private_key, vec![], vec![], vec![unfunded.clone(), funding], rng)
+        .unwrap();
+    assert_eq!(block.aborted_transaction_ids(), &[unfunded.id()]);
+    ledger.check_next_block(&block, rng).unwrap();
+    ledger.advance_to_next_block(&block).unwrap();
+
+    // The aborted transaction ID is blacklisted, so the resubmission is aborted again.
+    assert!(ledger.contains_transaction_id(&unfunded.id()).unwrap());
+    assert!(ledger.vm().check_transaction(&unfunded, None, rng).is_err());
+    let block =
+        ledger.prepare_advance_to_next_beacon_block(&private_key, vec![], vec![], vec![unfunded.clone()], rng).unwrap();
+    assert_eq!(block.transactions().len(), 0);
+    assert_eq!(block.aborted_transaction_ids(), &[unfunded.id()]);
+    ledger.check_next_block(&block, rng).unwrap();
+    ledger.advance_to_next_block(&block).unwrap();
 }
