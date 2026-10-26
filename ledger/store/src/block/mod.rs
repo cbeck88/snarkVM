@@ -484,8 +484,13 @@ pub trait BlockStorage<N: Network>: 'static + Clone + Send + Sync {
 
             // Store the aborted transaction IDs.
             self.aborted_transaction_ids_map().insert(block.hash(), block.aborted_transaction_ids().clone())?;
-            for aborted_transaction_id in block.aborted_transaction_ids() {
-                self.rejected_or_aborted_transaction_id_map().insert(*aborted_transaction_id, block.hash())?;
+            // Before `ConsensusVersion::V23`, the aborted transaction IDs are also indexed by transaction ID,
+            // which blacklists them (see `contains_transaction_id`). From V23, an aborted transaction has paid
+            // and consumed nothing, so it is not indexed and may be resubmitted.
+            if N::CONSENSUS_VERSION(block.height())? < ConsensusVersion::V23 {
+                for aborted_transaction_id in block.aborted_transaction_ids() {
+                    self.rejected_or_aborted_transaction_id_map().insert(*aborted_transaction_id, block.hash())?;
+                }
             }
 
             // Store the rejected transactions IDs.
@@ -603,8 +608,11 @@ pub trait BlockStorage<N: Network>: 'static + Clone + Send + Sync {
 
             // Remove the aborted transaction IDs.
             self.aborted_transaction_ids_map().remove(block_hash)?;
-            for aborted_transaction_id in aborted_transaction_ids {
-                self.rejected_or_aborted_transaction_id_map().remove(&aborted_transaction_id)?;
+            // Before `ConsensusVersion::V23`, the aborted transaction IDs are also indexed by transaction ID.
+            if N::CONSENSUS_VERSION(block_height)? < ConsensusVersion::V23 {
+                for aborted_transaction_id in aborted_transaction_ids {
+                    self.rejected_or_aborted_transaction_id_map().remove(&aborted_transaction_id)?;
+                }
             }
 
             // Remove the rejected state.
@@ -629,7 +637,8 @@ pub trait BlockStorage<N: Network>: 'static + Clone + Send + Sync {
         })
     }
 
-    /// Returns `true` if the given transaction ID exists.
+    /// Returns `true` if the given transaction ID exists, as a confirmed or rejected transaction,
+    /// or as a transaction aborted before `ConsensusVersion::V23`.
     fn contains_transaction_id(&self, transaction_id: &N::TransactionID) -> Result<bool> {
         Ok(self.transaction_store().contains_transaction_id(transaction_id)?
             || self.contains_rejected_or_aborted_transaction_id(transaction_id)?)
