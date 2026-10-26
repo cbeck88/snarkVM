@@ -109,15 +109,8 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
 
         /* Transaction */
 
-        // Get the maximum transaction size for the current consensus version.
-        let max_transaction_size = consensus_config_value!(N, MAX_TRANSACTION_SIZE, current_block_height)
-            .ok_or(anyhow!("Failed to fetch maximum transaction size"))?;
-        // Allocate a buffer to write the transaction.
-        let mut buffer = Vec::with_capacity(max_transaction_size);
         // Ensure that the transaction is well formed and does not exceed the maximum size.
-        if let Err(error) = transaction.write_le(LimitedWriter::new(&mut buffer, max_transaction_size)) {
-            bail!("Transaction '{}' is not well-formed: {error}", transaction.id())
-        }
+        self.check_transaction_size(transaction)?;
 
         // Ensure the transaction ID is unique.
         if self.block_store().contains_transaction_id(&transaction.id())? {
@@ -719,6 +712,63 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
 
         finish!(timer, "Verify the transaction");
         Ok(())
+    }
+
+    /// Ensures the given transaction is well-formed and does not exceed the maximum transaction size.
+    /// On failure, returns an error.
+    #[inline]
+    pub(crate) fn check_transaction_size(&self, transaction: &Transaction<N>) -> Result<()> {
+        // Get the current block height for consensus version checks.
+        let current_block_height = self.block_store().current_block_height();
+        // Get the maximum transaction size for the current consensus version.
+        let max_transaction_size = consensus_config_value!(N, MAX_TRANSACTION_SIZE, current_block_height)
+            .ok_or(anyhow!("Failed to fetch maximum transaction size"))?;
+        // Allocate a buffer to write the transaction.
+        let mut buffer = Vec::with_capacity(max_transaction_size);
+        // Ensure that the transaction is well formed and does not exceed the maximum size.
+        if let Err(error) = transaction.write_le(LimitedWriter::new(&mut buffer, max_transaction_size)) {
+            bail!("Transaction '{}' is not well-formed: {error}", transaction.id())
+        }
+        Ok(())
+    }
+
+    /// Ensures the given deployment or execution transaction can be rejected (fee charged) rather than
+    /// aborted, as `ConsensusVersion::V23` requires of a transaction that fails verification.
+    /// On failure, returns an error.
+    ///
+    /// The transaction must be well-formed, its rejected form must reconstruct the original transaction
+    /// (as `check_speculate` does from a block), and its fee transaction must verify on its own as the
+    /// fee of a rejected transaction (fee proof, payer balance, and uniqueness within the ledger).
+    #[inline]
+    pub(crate) fn check_rejectable<R: CryptoRng + Rng>(&self, transaction: &Transaction<N>, rng: &mut R) -> Result<()> {
+        // Ensure that the transaction is well formed and does not exceed the maximum size.
+        self.check_transaction_size(transaction)?;
+        // Construct the fee transaction and retrieve the deployment or execution ID.
+        let (fee_transaction, rejected_id) = match transaction {
+            Transaction::Deploy(id, deployment_id, owner, deployment, fee) => {
+                // Ensure the rejected form of the transaction reconstructs the original transaction.
+                let reconstructed = Transaction::from_deployment(*owner, *deployment.clone(), fee.clone())?;
+                ensure!(
+                    &reconstructed == transaction,
+                    "Transaction '{id}' does not reconstruct from its rejected form"
+                );
+                (Transaction::from_fee(fee.clone())?, *deployment_id)
+            }
+            Transaction::Execute(id, execution_id, execution, fee) => {
+                // Ensure the transaction has a fee.
+                let Some(fee) = fee else { bail!("Transaction '{id}' has no fee to charge") };
+                // Ensure the rejected form of the transaction reconstructs the original transaction.
+                let reconstructed = Transaction::from_execution(*execution.clone(), Some(fee.clone()))?;
+                ensure!(
+                    &reconstructed == transaction,
+                    "Transaction '{id}' does not reconstruct from its rejected form"
+                );
+                (Transaction::from_fee(fee.clone())?, *execution_id)
+            }
+            Transaction::Fee(id, _) => bail!("Transaction '{id}' is a fee transaction"),
+        };
+        // Verify the fee transaction as the fee of a rejected transaction.
+        self.check_transaction(&fee_transaction, Some(rejected_id), rng)
     }
 
     /// Verifies the `fee` in the given transaction. On failure, returns an error.

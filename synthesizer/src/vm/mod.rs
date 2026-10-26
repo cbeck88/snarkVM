@@ -122,6 +122,10 @@ use rayon::prelude::*;
 // This is because program upgrades, amendments and consensus version changes can change verification behavior.
 pub type TransactionCacheKey<N> = (<N as Network>::TransactionID, Vec<([U8<N>; 32], u16, u64, ConsensusVersion)>);
 
+/// The IDs of the transactions that failed verification but whose fee is valid, with the verification error.
+/// From `ConsensusVersion::V23`, such transactions are rejected (fee charged) during speculation.
+pub type UnverifiedTransactions<N> = IndexMap<<N as Network>::TransactionID, String>;
+
 #[derive(Clone)]
 pub struct VM<N: Network, C: ConsensusStorage<N>> {
     /// The process.
