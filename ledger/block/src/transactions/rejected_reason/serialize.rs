@@ -53,6 +53,16 @@ impl<N: Network> Serialize for RejectedReason<N> {
                     }
                     object.end()
                 }
+                Self::Verification => {
+                    let mut object = serializer.serialize_struct("RejectedReason", 1)?;
+                    object.serialize_field("type", "verification")?;
+                    object.end()
+                }
+                Self::Precondition => {
+                    let mut object = serializer.serialize_struct("RejectedReason", 1)?;
+                    object.serialize_field("type", "precondition")?;
+                    object.end()
+                }
             },
             false => ToBytesSerializer::serialize_with_size_encoding(self, serializer),
         }
@@ -100,6 +110,8 @@ impl<'de, N: Network> Deserialize<'de> for RejectedReason<N> {
                         };
                         Ok(Self::VM(program_id, resource))
                     }
+                    Some("verification") => Ok(Self::Verification),
+                    Some("precondition") => Ok(Self::Precondition),
                     _ => Err(de::Error::custom("Invalid rejected reason type")),
                 }
             }

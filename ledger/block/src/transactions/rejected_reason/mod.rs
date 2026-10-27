@@ -33,6 +33,16 @@ pub enum RejectedReason<N: Network> {
     /// The transaction was rejected due to a VM error not captured by a finalize command.
     /// The programID and resource are logged if they are available.
     VM(Option<(ProgramID<N>, u16)>, Option<Identifier<N>>),
+
+    /// The transaction was rejected because its deployment or execution failed verification,
+    /// while its fee was valid. (`ConsensusVersion::V23` and later.)
+    /// Note: The verification error is not stored, as it may contain large or sensitive data.
+    Verification,
+
+    /// The transaction was rejected because it failed a speculation precondition (e.g. a duplicate
+    /// transition, input, or output within the block, or a spend limit), while its fee was valid.
+    /// (`ConsensusVersion::V23` and later.)
+    Precondition,
 }
 
 impl<N: Network> RejectedReason<N> {
@@ -84,6 +94,8 @@ pub mod test_helpers {
             RejectedReason::VM(None, Some(bond)),
             RejectedReason::VM(Some((credits, 0u16)), None),
             RejectedReason::VM(None, None),
+            RejectedReason::Verification,
+            RejectedReason::Precondition,
         ]
     }
 }
